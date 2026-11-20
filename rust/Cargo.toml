@@ -1,0 +1,74 @@
+# Created by sdk-kit 0.3.0; owned by this repository (keep the category features).
+[package]
+name = "grow-oidc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+# MSRV-aware dependency resolution (picks versions that still build on rust-version).
+resolver = "3"
+description = "Rust SDK for OIDC by Grow Codes"
+authors = ["Grow Codes <opensource@grow.codes>"]
+license = "Apache-2.0"
+homepage = "https://grow-codes-packages.github.io/oidc/"
+repository = "https://github.com/grow-codes-packages/oidc"
+documentation = "https://docs.rs/grow-oidc"
+readme = "README.md"
+keywords = ["grow-codes", "oidc", "jwt", "jwks", "axum"]
+categories = ["authentication", "web-programming", "asynchronous"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "AGENTS.md", "LICENSE", "NOTICE"]
+
+[lib]
+name = "grow_oidc"
+path = "src/lib.rs"
+
+[features]
+default = [
+]
+# Blocking wrapper (`blocking::OidcClient`) that owns a one-worker multi-thread tokio
+# runtime (background batching and exports keep running between blocking calls).
+blocking = []
+# In-memory fakes and the conformance runner (`testing` module).
+testing = []
+# `OidcLayer` / `RequireRolesLayer` for tower-based servers (axum, tonic, hyper).
+tower = ["dep:tower-layer", "dep:tower-service", "dep:http"]
+
+[dependencies]
+async-trait = "0.1.80"
+base64 = "0.22"
+http = { version = "1.1", optional = true }
+ring = "0.17.8"
+tower-layer = { version = "0.3.3", optional = true }
+tower-service = { version = "0.3.3", optional = true }
+bytes = "1.6"
+futures = { version = "0.3.30", default-features = false, features = ["std", "async-await"] }
+httpdate = "1.0"
+rand = { version = "0.9", default-features = false, features = ["std", "thread_rng"] }
+reqwest = { version = "0.12.9", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip"] }
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.120"
+sha2 = "0.10.8"
+tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+tokio-util = { version = "0.7.11", default-features = false }
+tracing = { version = "0.1.40", default-features = false, features = ["std", "attributes"] }
+url = "2.5"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+wiremock = "0.6"
+tracing-subscriber = { version = "0.3.18", default-features = false, features = ["std", "fmt", "registry"] }
+serde_json = "1.0.120"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http = "1.1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(coverage_nightly)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
