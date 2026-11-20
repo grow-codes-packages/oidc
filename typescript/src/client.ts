@@ -14,12 +14,19 @@ import { OidcConfig, type OidcConfigOptions } from "./config.js";
 /** Discovery document path, relative to the provider URL (keeps realm prefixes such as Keycloak's). */
 export const DISCOVERY_PATH = ".well-known/openid-configuration";
 
+/** `value` without trailing slashes (a loop, not a regex: no backtracking on long inputs). */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return value.slice(0, end);
+}
+
 /**
  * Path of an endpoint relative to the provider URL: the part after the provider URL when the
  * endpoint starts with it (keeps realm prefixes out), else the endpoint's own path and query.
  */
 export function relativeEndpoint(base: string, endpoint: string): string {
-  const root = base.replace(/\/+$/u, "");
+  const root = trimTrailingSlashes(base);
   if (endpoint.startsWith(root + "/")) return endpoint.slice(root.length);
   try {
     const url = new URL(endpoint);
