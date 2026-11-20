@@ -24,14 +24,29 @@ struct Inner {
     on_close: CloseGroup,
 }
 
-#[derive(Deserialize)]
-struct StatusBody {
-    status: Option<String>,
-}
+/// Discovery document path, relative to the provider URL (realm prefixes such as Keycloak's kept).
+pub const DISCOVERY_PATH: &str = ".well-known/openid-configuration";
 
 #[derive(Deserialize)]
-struct VersionBody {
-    version: Option<String>,
+struct Discovery {
+    issuer: Option<String>,
+    userinfo_endpoint: Option<String>,
+}
+
+/// Path of `endpoint` relative to the provider URL `base`: the part after `base` when the endpoint
+/// starts with it (keeps realm prefixes out), else the endpoint's own path and query.
+pub fn relative_endpoint(base: &str, endpoint: &str) -> String {
+    let root = base.trim_end_matches('/');
+    if let Some(rest) = endpoint.strip_prefix(root).filter(|r| r.starts_with('/')) {
+        return rest.to_owned();
+    }
+    match url::Url::parse(endpoint) {
+        Ok(u) => match u.query() {
+            Some(q) => format!("{}?{q}", u.path()),
+            None => u.path().to_owned(),
+        },
+        Err(_) => endpoint.to_owned(),
+    }
 }
 
 impl OidcClient {
@@ -74,12 +89,12 @@ impl OidcClient {
         self.inner.on_close.register(f);
     }
 
-    /// Unauthenticated liveness check. Never fails for an unhealthy or unreachable service;
-    /// only `CANCELLED` and `CONFIG` are returned as errors.
+    /// Unauthenticated liveness check: `GET <url>/.well-known/openid-configuration`. Never fails
+    /// for an unhealthy or unreachable provider; only `CANCELLED` and `CONFIG` are returned.
     pub async fn health(&self) -> Result<HealthStatus> {
         let resp = self
             .transport()
-            .get("/health")
+            .get(DISCOVERY_PATH)
             .operation("health")
             .ok_status(500)
             .ok_status(503)
@@ -89,19 +104,35 @@ impl OidcClient {
             Ok(resp) => resp,
             Err(err) => return HealthStatus::from_error(err),
         };
-        let word = resp.json::<StatusBody>().ok().and_then(|b| b.status);
-        Ok(if resp.status() < 300 {
-            HealthStatus::healthy(word.unwrap_or_else(|| "ok".to_owned()))
-        } else {
-            HealthStatus::unhealthy(word.unwrap_or_else(|| "unhealthy".to_owned()))
-                .with_detail("httpStatus", resp.status().to_string())
-        })
+        if resp.status() >= 300 {
+            return Ok(HealthStatus::unhealthy("unhealthy")
+                .with_detail("httpStatus", resp.status().to_string()));
+        }
+        let mut status = HealthStatus::healthy("ok");
+        if let Some(issuer) = resp.json::<Discovery>().ok().and_then(|d| d.issuer) {
+            status = status.with_detail("issuer", issuer);
+        }
+        Ok(status)
     }
 
-    /// Authenticated round trip; returns the latency. `AUTHENTICATION` on bad credentials.
+    /// Authenticated round trip with the configured access token: `GET` the provider's
+    /// `userinfo_endpoint` from discovery. `AUTHENTICATION` for a rejected token, `UNSUPPORTED`
+    /// when the provider has no userinfo endpoint.
     pub async fn ping(&self) -> Result<Duration> {
         let started = Instant::now();
-        let mut req = self.transport().get("/v1/ping").operation("ping");
+        let doc = self
+            .transport()
+            .get(DISCOVERY_PATH)
+            .operation("ping")
+            .send()
+            .await?;
+        let endpoint = doc
+            .json::<Discovery>()?
+            .userinfo_endpoint
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| Error::unsupported("ping: the provider has no userinfo endpoint"))?;
+        let path = relative_endpoint(self.config().url().as_str(), &endpoint);
+        let mut req = self.transport().get(&path).operation("ping");
         if let Some(token) = self.config().token() {
             req = req.bearer(token);
         }
@@ -109,21 +140,12 @@ impl OidcClient {
         Ok(started.elapsed())
     }
 
-    /// Server version string; `UNSUPPORTED` when the service exposes none.
+    /// `UNSUPPORTED`: OpenID Connect providers expose no version (`CANCELLED` once closed).
     pub async fn server_version(&self) -> Result<String> {
-        let resp = self
-            .transport()
-            .get("/version")
-            .operation("serverVersion")
-            .send()
-            .await
-            .map_err(|e| match e.http_status() {
-                Some(404) => Error::unsupported("serverVersion: the service exposes no version"),
-                _ => e,
-            })?;
-        resp.json::<VersionBody>()?
-            .version
-            .ok_or_else(|| Error::unsupported("serverVersion: the service exposes no version"))
+        self.transport().ensure_open("serverVersion")?;
+        Err(Error::unsupported(
+            "serverVersion: OpenID Connect providers expose no version",
+        ))
     }
 
     /// Flushes and stops background work, then closes the transport. Idempotent.

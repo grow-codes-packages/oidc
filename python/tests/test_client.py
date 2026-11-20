@@ -25,33 +25,60 @@ def aclient(url: str, **kw: Any) -> sdk.AsyncOidcClient:
 # --------------------------------------------------------------------------- sync
 
 
+DISCOVERY = "/.well-known/openid-configuration"
+
+
+def discovery(server: MockServer, *, query: str = "") -> None:
+    server.enqueue(
+        DISCOVERY,
+        Reply(
+            200,
+            {
+                "issuer": "http://idp.test",
+                "userinfo_endpoint": server.url + "/api/userinfo" + query,
+            },
+        ),
+    )
+
+
 def test_health_ping_version(server: MockServer) -> None:
-    server.enqueue("/health", Reply(200, {"status": "ok", "build": 7, "nested": {"x": 1}}))
-    server.enqueue("/version", Reply(200, {"version": "1.2.3"}))
+    server.enqueue(DISCOVERY, Reply(200, {"issuer": "http://idp.test", "jwks_uri": "x"}))
+    discovery(server, query="?schema=openid")
     with client(server.url, token=TOKEN) as c:
         health = c.health()
-        assert health == sdk.HealthStatus(True, "ok", {"build": "7"})
+        assert health == sdk.HealthStatus(True, "ok", {"issuer": "http://idp.test"})
         latency = c.ping()
         assert isinstance(latency, float) and latency >= 0
-        assert c.server_version() == "1.2.3"
+        with pytest.raises(sdk.UnsupportedError):
+            c.server_version()
         assert "client-token" not in repr(c)
-    ping = next(s for s in server.seen if s.path == "/v1/ping")
+    ping = next(s for s in server.seen if s.path.startswith("/api/userinfo"))
     assert ping.headers["Authorization"] == f"Bearer {TOKEN}"
-    health_req = next(s for s in server.seen if s.path == "/health")
-    assert "Authorization" not in health_req.headers
+    for seen in server.seen:
+        if seen.path == DISCOVERY:
+            assert "Authorization" not in seen.headers
+    with pytest.raises(sdk.CancelledError):
+        c.server_version()
 
 
 def test_health_variants(server: MockServer) -> None:
     c = client(server.url)
-    server.enqueue("/health", Reply(503, {"status": "degraded"}))
-    assert c.health() == sdk.HealthStatus(False, "degraded", {"httpStatus": "503"})
-    server.enqueue("/health", Reply(500, "boom"))
-    assert c.health() == sdk.HealthStatus(False, "unhealthy", {"httpStatus": "500"})
-    server.enqueue("/health", Reply(200, "OK"))
+    server.enqueue(DISCOVERY, Reply(503, {"status": "degraded"}))
+    assert c.health() == sdk.HealthStatus(False, "unhealthy", {"httpStatus": "503"})
+    server.enqueue(DISCOVERY, Reply(200, "OK"))
     assert c.health() == sdk.HealthStatus(True, "ok", {})
-    server.enqueue("/health", Reply(200, [1, 2]))
+    server.enqueue(DISCOVERY, Reply(200, [1, 2]))
     assert c.health().healthy
-    assert len([s for s in server.seen if s.path == "/health"]) == 4  # health never retries
+    assert len([s for s in server.seen if s.path == DISCOVERY]) == 3  # health never retries
+
+
+def test_relative_endpoint() -> None:
+    assert (
+        sdk.relative_endpoint("http://kc/realms/x/", "http://kc/realms/x/protocol/ui")
+        == "/protocol/ui"
+    )
+    assert sdk.relative_endpoint("http://a", "http://b/api/userinfo?x=1") == "/api/userinfo?x=1"
+    assert sdk.relative_endpoint("http://a", "http://b/api/userinfo") == "/api/userinfo"
 
 
 def test_core_health_unreachable() -> None:
@@ -64,7 +91,7 @@ def test_core_health_unreachable() -> None:
 
 
 def test_health_timeout_is_unreachable(server: MockServer) -> None:
-    server.enqueue("/health", Reply(200, delay=1.0))
+    server.enqueue(DISCOVERY, Reply(200, delay=1.0))
     c = client(server.url, request_timeout=0.1)
     assert c.health().status == "unreachable"
 
@@ -86,23 +113,16 @@ def test_health_raises_only_cancelled_and_config(server: MockServer) -> None:
 
 
 def test_ping_bad_credentials(server: MockServer) -> None:
-    server.enqueue("/v1/ping", Reply(401, {"error": "unauthorized"}))
+    discovery(server)
+    server.enqueue("/api/userinfo", Reply(401, {"error": "unauthorized"}))
     with pytest.raises(sdk.AuthenticationError):
         client(server.url).ping()
 
 
-def test_server_version_errors(server: MockServer) -> None:
-    c = client(server.url)
-    server.enqueue("/version", Reply(404))
-    with pytest.raises(sdk.UnsupportedError) as info:
-        c.server_version()
-    assert info.value.http_status == 404
-    server.enqueue("/version", Reply(200, {"nope": 1}))
-    with pytest.raises(sdk.ValidationError):
-        c.server_version()
-    server.enqueue("/version", Reply(403))
-    with pytest.raises(sdk.PermissionDeniedError):
-        c.server_version()
+def test_ping_without_userinfo(server: MockServer) -> None:
+    server.enqueue(DISCOVERY, Reply(200, {"issuer": "x"}))
+    with pytest.raises(sdk.UnsupportedError):
+        client(server.url).ping()
 
 
 def test_core_close_idempotent(server: MockServer) -> None:
@@ -139,12 +159,13 @@ def test_from_env_and_raw_request(server: MockServer, monkeypatch: pytest.Monkey
 
 
 async def test_async_client(server: MockServer, monkeypatch: pytest.MonkeyPatch) -> None:
-    server.enqueue("/health", Reply(200, {"status": "ok"}))
-    server.enqueue("/version", Reply(200, {"version": "9.9.9"}))
+    server.enqueue(DISCOVERY, Reply(200, {"issuer": "x"}))
+    discovery(server)
     async with aclient(server.url, token=TOKEN) as c:
         assert (await c.health()).healthy
         assert await c.ping() >= 0
-        assert await c.server_version() == "9.9.9"
+        with pytest.raises(sdk.UnsupportedError):
+            await c.server_version()
         assert (await c.request(sdk.Request("GET", "/raw"))).status == 200
         assert "client-token" not in repr(c)
         assert c.resources is not None
@@ -153,13 +174,9 @@ async def test_async_client(server: MockServer, monkeypatch: pytest.MonkeyPatch)
         await c.health()
     env = {sdk.ENV_PREFIX + "URL": server.url}
     c2 = sdk.AsyncOidcClient.from_env(env)
-    server.enqueue("/version", Reply(501))
-    with pytest.raises(sdk.UnsupportedError):
-        await c2.server_version()
-    server.enqueue("/version", Reply(404))
-    with pytest.raises(sdk.UnsupportedError):
-        await c2.server_version()
     await c2.aclose()
+    with pytest.raises(sdk.CancelledError):
+        await c2.server_version()
     monkeypatch.setenv(sdk.ENV_PREFIX + "URL", server.url)
     c3 = sdk.AsyncOidcClient()
     assert c3.config.url == server.url
@@ -175,7 +192,7 @@ async def test_async_health_unreachable() -> None:
 
 
 async def test_async_health_cancel(server: MockServer) -> None:
-    server.enqueue("/health", Reply(200, delay=2.0))
+    server.enqueue(DISCOVERY, Reply(200, delay=2.0))
     c = aclient(server.url)
     errors: list[BaseException] = []
     task = spawn_capturing(c.health(), errors)

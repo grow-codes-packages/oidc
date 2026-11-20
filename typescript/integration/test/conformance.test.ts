@@ -17,7 +17,7 @@ test("conformance: core", async () => {
     scenariosDir,
     categories: ["core"],
     factories: { core: () => OidcClient.fromEnv() },
-    capabilities: { core: ["version"] },
+    capabilities: { core: [] },
   });
   console.log(formatReport(report));
   assert.equal(report.failed, 0, formatReport(report));

@@ -208,7 +208,7 @@ TypeScript and Java, `from_env` in Python and Rust, `FromEnv` in Go).
 | Java | `OidcFilter`, `RequireRolesFilter`, `verifyAsync` | Jakarta Servlet filters |
 | Rust | `OidcLayer`, `RequireRolesLayer` (feature `tower`) | tower layers for axum/tonic/hyper |
 | Testing | `FakeIdp` / `oidctest` / `FakeIdP` | local fake OpenID provider (discovery, JWKS, minting, rotation) |
-| Client | `health`, `ping`, `serverVersion`, `close` | generated core client (sdk-kit) |
+| Client | `health`, `ping`, `serverVersion`, `close` | provider client: `health` reads discovery, `ping` calls `userinfo_endpoint` with `GROW_OIDC_TOKEN`, `serverVersion` is `UNSUPPORTED` (OIDC has no version) |
 
 <!-- /service:function-overview -->
 

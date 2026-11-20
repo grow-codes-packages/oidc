@@ -14,7 +14,7 @@ use sdk::core::env::ENV_PREFIX;
 use sdk::core::{EnvReader, ErrorCode, Hooks, RetryPolicy, TlsConfig};
 use sdk::DEFAULT_URL;
 use serde_json::json;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use sdk::OidcClient as Client;
@@ -30,22 +30,23 @@ fn client(url: &str, token: Option<&str>) -> Client {
 
 async fn demo_server() -> MockServer {
     let server = MockServer::start().await;
+    let userinfo = format!("{}/api/userinfo?schema=openid", server.uri());
     Mock::given(method("GET"))
-        .and(path("/health"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"issuer": "http://idp.test", "userinfo_endpoint": userinfo})),
+        )
         .mount(&server)
         .await;
-    Mock::given(path("/v1/ping"))
+    Mock::given(path("/api/userinfo"))
+        .and(query_param("schema", "openid"))
         .and(header("authorization", "Bearer demo-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pong": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sub": "u"})))
         .mount(&server)
         .await;
-    Mock::given(path("/v1/ping"))
+    Mock::given(path("/api/userinfo"))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "unauthorized"})))
-        .mount(&server)
-        .await;
-    Mock::given(path("/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"version": "1.0.0"})))
         .mount(&server)
         .await;
     server
@@ -58,8 +59,12 @@ async fn client_surface() {
     let h = c.health().await.unwrap();
     assert!(h.healthy);
     assert_eq!(h.status, "ok");
+    assert_eq!(h.details["issuer"], "http://idp.test");
     assert!(c.ping().await.unwrap() < Duration::from_secs(5));
-    assert_eq!(c.server_version().await.unwrap(), "1.0.0");
+    assert_eq!(
+        c.server_version().await.unwrap_err().code(),
+        ErrorCode::Unsupported
+    );
     assert_eq!(c.config().token().unwrap().expose_secret(), "demo-token");
     assert!(format!("{c:?}").contains("[REDACTED]"));
     assert!(!format!("{c:?}").contains("demo-token"));
@@ -78,43 +83,42 @@ async fn client_surface() {
 #[tokio::test]
 async fn client_health_variants() {
     let server = MockServer::start().await;
-    Mock::given(path("/a/health"))
-        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"status": "degraded"})))
-        .mount(&server)
-        .await;
-    Mock::given(path("/b/health"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-    Mock::given(path("/c/health"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-    Mock::given(path("/d/health"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
-        .await;
-    let a = client(&format!("{}/a", server.uri()), None)
-        .health()
-        .await
-        .unwrap();
-    assert_eq!((a.healthy, a.status.as_str()), (false, "degraded"));
-    assert_eq!(a.details["httpStatus"], "503");
-    let b = client(&format!("{}/b", server.uri()), None)
-        .health()
-        .await
-        .unwrap();
-    assert_eq!((b.healthy, b.status.as_str()), (false, "unhealthy"));
-    let c = client(&format!("{}/c", server.uri()), None)
-        .health()
-        .await
-        .unwrap();
-    assert_eq!((c.healthy, c.status.as_str()), (false, "unhealthy"));
-    let d = client(&format!("{}/d", server.uri()), None)
-        .health()
-        .await
-        .unwrap();
-    assert_eq!((d.healthy, d.status.as_str()), (true, "ok"));
+    for (prefix, status) in [("a", 503), ("b", 500), ("c", 404), ("d", 204)] {
+        Mock::given(path(format!("/{prefix}/.well-known/openid-configuration")))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+    }
+    for (prefix, healthy, word) in [
+        ("a", false, "unhealthy"),
+        ("b", false, "unhealthy"),
+        ("c", false, "unhealthy"),
+        ("d", true, "ok"),
+    ] {
+        let h = client(&format!("{}/{prefix}", server.uri()), None)
+            .health()
+            .await
+            .unwrap();
+        assert_eq!((h.healthy, h.status.as_str()), (healthy, word), "{prefix}");
+    }
+}
+
+#[test]
+fn relative_endpoints() {
+    assert_eq!(
+        sdk::relative_endpoint("http://kc/realms/x/", "http://kc/realms/x/protocol/ui"),
+        "/protocol/ui"
+    );
+    assert_eq!(
+        sdk::relative_endpoint("http://a", "http://b/api/userinfo?x=1"),
+        "/api/userinfo?x=1"
+    );
+    assert_eq!(
+        sdk::relative_endpoint("http://a", "http://b/api/userinfo"),
+        "/api/userinfo"
+    );
+    assert_eq!(sdk::relative_endpoint("http://a", "/userinfo"), "/userinfo");
+    assert_eq!(sdk::DISCOVERY_PATH, ".well-known/openid-configuration");
 }
 
 #[tokio::test]
@@ -130,35 +134,19 @@ async fn core_health_unreachable() {
 }
 
 #[tokio::test]
-async fn client_server_version_unsupported() {
+async fn client_ping_and_version_errors() {
     let server = MockServer::start().await;
-    Mock::given(path("/a/version"))
-        .respond_with(ResponseTemplate::new(404))
+    Mock::given(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issuer": "x"})))
         .mount(&server)
         .await;
-    Mock::given(path("/b/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-    Mock::given(path("/c/version"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&server)
-        .await;
-    let a = client(&format!("{}/a", server.uri()), None)
-        .server_version()
-        .await
-        .unwrap_err();
-    assert_eq!(a.code(), ErrorCode::Unsupported);
-    let b = client(&format!("{}/b", server.uri()), None)
-        .server_version()
-        .await
-        .unwrap_err();
-    assert_eq!(b.code(), ErrorCode::Unsupported);
-    let c = client(&format!("{}/c", server.uri()), None)
-        .server_version()
-        .await
-        .unwrap_err();
-    assert_eq!(c.code(), ErrorCode::PermissionDenied);
+    let c = client(&server.uri(), None);
+    assert_eq!(c.ping().await.unwrap_err().code(), ErrorCode::Unsupported);
+    c.close().await;
+    assert_eq!(
+        c.server_version().await.unwrap_err().code(),
+        ErrorCode::Cancelled
+    );
 }
 
 #[tokio::test]
@@ -293,7 +281,7 @@ async fn conformance_core_with_client() {
         )
     };
     let report = ConformanceRunner::new(scenarios_dir(env!("CARGO_MANIFEST_DIR")))
-        .capabilities(["version"])
+        .capabilities(Vec::<String>::new())
         .handler(CoreHandler::new(factory))
         .run()
         .await

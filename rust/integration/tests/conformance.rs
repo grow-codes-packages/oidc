@@ -24,10 +24,22 @@ async fn client_round_trip() {
     let health = c.health().await.expect("health");
     assert!(health.healthy, "service not healthy: {health:?}");
     c.ping().await.expect("authenticated ping");
-    match c.server_version().await {
-        Ok(v) => assert!(!v.is_empty()),
-        Err(e) => assert_eq!(e.code(), ErrorCode::Unsupported, "{e}"),
-    }
+    // OpenID Connect providers expose no version.
+    assert_eq!(
+        c.server_version().await.unwrap_err().code(),
+        ErrorCode::Unsupported
+    );
+    let wrong = Client::new(
+        Config::builder()
+            .url(c.config().url().as_str())
+            .token("wrong-token-for-integration")
+            .build()
+            .expect("config"),
+    )
+    .expect("client");
+    let err = wrong.ping().await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::Authentication, "{err}");
+    assert!(!err.to_string().contains("wrong-token"));
     c.close().await;
     c.close().await;
 }
@@ -47,7 +59,8 @@ async fn conformance() {
     #[allow(unused_mut)]
     let mut runner = ConformanceRunner::new(conformance_dir())
         // Declare what the service supports; justify every skip in docs/compatibility.md.
-        .capabilities(["version", "write", "delete", "versions", "query"])
+        // no "version": OpenID Connect providers expose none
+        .capabilities(Vec::<String>::new())
         .handler(CoreHandler::new(Client::from_env));
     let report = runner.run().await.expect("scenarios load");
     println!("{report}");

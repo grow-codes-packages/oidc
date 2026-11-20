@@ -63,13 +63,30 @@ Tests: `import "github.com/grow-codes-packages/oidc/go/oidctest"` → `idp := oi
 ## Python — `pip install grow-oidc` (`[fastapi]`, `[django]` extras)
 
 ```python
-from grow_oidc import Verifier, require_user, OidcMiddleware, DjangoOidcMiddleware, django_require_roles
-verifier = Verifier.from_env()          # or Verifier(issuer, audience, jwks_url=None, roles_claim="roles")
-user = verifier.verify(token)           # AuthUser(sub, roles, claims, email, name); await verifier.averify(token)
-@app.get("/admin")                      # FastAPI; verifier defaults to Verifier.from_env()
+from grow_oidc import (
+    AuthUser,
+    DjangoOidcMiddleware,
+    OidcMiddleware,
+    Verifier,
+    django_require_roles,
+    require_user,
+)
+
+# or Verifier(issuer, audience, jwks_url=None, roles_claim="roles")
+verifier = Verifier.from_env()
+# AuthUser(sub, roles, claims, email, name); async: await verifier.averify(token)
+user = verifier.verify(token)
+
+
+# FastAPI; the verifier defaults to Verifier.from_env()
+@app.get("/admin")
 async def admin(user: AuthUser = Depends(require_user(roles=["admin"]))): ...
-app.add_middleware(OidcMiddleware, verifier=verifier)   # pure ASGI; public_paths default /health*, /docs, /openapi.json
-# Django: MIDDLEWARE += ["grow_oidc.integrations.DjangoOidcMiddleware"]; @django_require_roles("admin") on views
+
+
+# pure ASGI; public_paths default /health*, /docs, /openapi.json
+app.add_middleware(OidcMiddleware, verifier=verifier)
+# Django: MIDDLEWARE += ["grow_oidc.integrations.DjangoOidcMiddleware"]
+# and @django_require_roles("admin") on views
 ```
 Tests: `from grow_oidc.oidctest import FakeIdP` → `with FakeIdP(audience="api") as idp: idp.mint({"roles": ["admin"]})`.
 

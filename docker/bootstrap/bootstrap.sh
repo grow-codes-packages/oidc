@@ -3,7 +3,7 @@
 #
 # OWNED BY THIS REPOSITORY: sdk-kit writes this skeleton once and never overwrites it.
 # Runs in the `bootstrap` service of docker/compose.service.yml after `service` is healthy.
-# Prepare OIDC for the tests (init/unseal, users, tokens, streams, buckets ...) and write
+# Prepare Casdoor (the OpenID provider under test) for the tests (init/unseal, users, tokens, streams, buckets ...) and write
 # the credentials the tests need to /bootstrap/env with bootstrap_set. Exit non-zero on failure:
 # the test containers then never start and compose-run.sh prints this job's log.
 # Never print secret values.
@@ -15,13 +15,14 @@ set -eu
 
 bootstrap_begin
 
-# --- service-specific steps (replace) ---------------------------------------------------------
-# Example: wait for an extra endpoint, create a token through the API and hand it to the tests.
-#   bootstrap_wait_http -t 120 "$SERVICE_URL/health"
-#   token=$(wget -q -O - --header "Authorization: Bearer $ADMIN_TOKEN" --post-data '{}' \
-#     "$SERVICE_URL/api/tokens" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-#   [ -n "$token" ] || bootstrap_fail "could not create a token"
-#   bootstrap_set GROW_OIDC_TOKEN "$token"
+# --- Casdoor: organization, application, role, user and a real access token ---------------------
+bootstrap_wait_http -t 120 "$SERVICE_URL/api/health"
+minted=$(mktemp)
+python3 /scripts/mint.py "$minted" || bootstrap_fail "minting a Casdoor token failed"
+while IFS='=' read -r key value; do
+  [ -n "$key" ] && bootstrap_set "$key" "$value"
+done <"$minted"
+rm -f "$minted"
 # -------------------------------------------------------------------------------------------------
 
 bootstrap_commit

@@ -43,6 +43,15 @@ instead and returns the names it set.
   RSA fixture. The other languages export one (`FakeIdp`, `oidctest`, `FakeIdP`, `oidctest.FakeIdp`).
 - Python's `averify` does not deduplicate concurrent JWKS fetches (the sync `verify` does).
 - Java's `verifyAsync` runs `verify` on the common pool.
-- The Docker suite (`docker/compose.service.yml`) still has the sdk-kit placeholder service; a
-  Casdoor + token-minting bootstrap is open work. Unit conformance runs against local fake IdPs.
+- The Docker suite runs Casdoor v4.27.1 + PostgreSQL (`docker/compose.service.yml`).
+  `docker/bootstrap/mint.py` creates organization `oidc-it`, application `oidc-it-app` (JWT
+  tokens, password grant), role `oidc-it-admin` and user `oidc-it-user`, mints a real access token
+  and writes `GROW_OIDC_TOKEN`, `GROW_AUTH_ISSUER` (the token `iss`, `http://service:8000`),
+  `GROW_AUTH_AUDIENCE`/`GROW_AUTH_CLIENT_ID` and the expected `sub`/`email`/role. Every language
+  verifies that token with `Verifier.fromEnv` (discovery + JWKS).
+- `serverVersion` is always `UNSUPPORTED`: OpenID Connect has no version endpoint, so the core
+  conformance step `serverVersion` (capability `version`) is skipped in every language.
+- `OidcClient.health` reads `<url>/.well-known/openid-configuration`; `ping` calls the
+  provider's `userinfo_endpoint` with `GROW_OIDC_TOKEN` (an access token), so a wrong token is
+  `AUTHENTICATION`.
 

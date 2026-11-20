@@ -361,9 +361,11 @@ def test_context_resolve_and_close() -> None:
 
 
 def demo_server(server: MockServer) -> None:
-    server.defaults["/health"] = Reply(200, {"status": "ok"})
-    server.defaults["/v1/ping"] = Reply(200, {"pong": True})
-    server.defaults["/version"] = Reply(200, {"version": "1.0.0"})
+    """A minimal OpenID provider: discovery + userinfo."""
+    server.defaults["/.well-known/openid-configuration"] = Reply(
+        200, {"issuer": server.url, "userinfo_endpoint": server.url + "/api/userinfo"}
+    )
+    server.defaults["/api/userinfo"] = Reply(200, {"sub": "user-1"})
 
 
 @pytest.mark.parametrize("scenario_doc", r.pytest_params(categories=["core"]))
@@ -371,7 +373,7 @@ def test_core_scenarios_sync(server: MockServer, scenario_doc: dict[str, Any]) -
     demo_server(server)
     runner = r.ConformanceRunner(
         {"core": lambda c: sdk.OidcClient(make_config(server.url, token="t-1234"))},
-        capabilities={"version"},
+        capabilities=set(),
     )
     result = r.assert_scenario(runner, scenario_doc)
     assert result.status == "passed"

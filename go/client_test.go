@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -86,12 +87,10 @@ func TestClientConfig(t *testing.T) {
 func TestClient(t *testing.T) {
 	ts := newTestServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
 		switch r.URL.Path {
-		case "/health":
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-		case "/version":
-			_, _ = w.Write([]byte(`{"version":"9.9.9"}`))
-		case "/v1/ping":
-			if r.Header.Get("Authorization") != "Bearer "+testToken {
+		case "/.well-known/openid-configuration":
+			_, _ = w.Write([]byte(`{"issuer":"http://idp.test","userinfo_endpoint":"http://` + r.Host + `/api/userinfo?schema=openid","jwks_uri":"x"}`))
+		case "/api/userinfo":
+			if r.Header.Get("Authorization") != "Bearer "+testToken || r.URL.Query().Get("schema") != "openid" {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -103,14 +102,14 @@ func TestClient(t *testing.T) {
 
 	t.Run("health ping version", func(t *testing.T) {
 		c := newTestClient(t, ts.URL, nil)
-		if hs, err := c.Health(t.Context()); err != nil || !hs.Healthy || hs.Status != "ok" {
+		if hs, err := c.Health(t.Context()); err != nil || !hs.Healthy || hs.Status != "ok" || hs.Details["issuer"] != "http://idp.test" || len(hs.Details) != 2 {
 			t.Fatalf("health %+v %v", hs, err)
 		}
 		if d, err := c.Ping(t.Context()); err != nil || d <= 0 {
 			t.Fatalf("ping %s %v", d, err)
 		}
-		if v, err := c.ServerVersion(t.Context()); err != nil || v != "9.9.9" {
-			t.Fatalf("version %q %v", v, err)
+		if _, err := c.ServerVersion(t.Context()); !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("version %v", err)
 		}
 		if c.Config().URL != ts.URL {
 			t.Fatal("Config()")
@@ -128,19 +127,44 @@ func TestClient(t *testing.T) {
 		}
 	})
 
-	t.Run("server version errors", func(t *testing.T) {
-		ts404 := newTestServer(t, statusHandler(http.StatusNotFound))
-		if _, err := newTestClient(t, ts404.URL, nil).ServerVersion(t.Context()); !errors.Is(err, ErrUnsupported) {
-			t.Fatalf("no version endpoint: %v", err)
+	t.Run("ping and version errors", func(t *testing.T) {
+		noUserinfo := newTestServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) { _, _ = w.Write([]byte(`{"issuer":"x"}`)) })
+		if _, err := newTestClient(t, noUserinfo.URL, nil).Ping(t.Context()); !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("no userinfo: %v", err)
 		}
 		ts500 := newTestServer(t, statusHandler(http.StatusInternalServerError))
 		c := newTestClient(t, ts500.URL, func(cfg *Config) { cfg.Retry = fastRetry(0) })
-		if _, err := c.ServerVersion(t.Context()); !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("version 500: %v", err)
+		if _, err := c.Ping(t.Context()); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("discovery 500: %v", err)
+		}
+		if hs, err := c.Health(t.Context()); err != nil || hs.Healthy {
+			t.Fatalf("health 500: %+v %v", hs, err)
 		}
 		tsBad := newTestServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) { _, _ = w.Write([]byte("nope")) })
-		if _, err := newTestClient(t, tsBad.URL, nil).ServerVersion(t.Context()); !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("version decode: %v", err)
+		if _, err := newTestClient(t, tsBad.URL, nil).Ping(t.Context()); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("discovery decode: %v", err)
+		}
+		cancelled, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := c.ServerVersion(cancelled); !errors.Is(err, ErrCancelled) {
+			t.Fatalf("version cancelled: %v", err)
+		}
+		_ = c.Close()
+		if _, err := c.ServerVersion(t.Context()); !errors.Is(err, ErrCancelled) {
+			t.Fatalf("version closed: %v", err)
+		}
+	})
+
+	t.Run("relative endpoint", func(t *testing.T) {
+		for _, tc := range [][3]string{
+			{"http://kc/realms/x/", "http://kc/realms/x/protocol/userinfo", "/protocol/userinfo"},
+			{"http://a", "http://b/api/userinfo?x=1", "/api/userinfo?x=1"},
+			{"http://a", "http://b/api/userinfo", "/api/userinfo"},
+			{"http://a", "::bad", "::bad"},
+		} {
+			if got := RelativeEndpoint(tc[0], tc[1]); got != tc[2] {
+				t.Fatalf("%v: %q", tc, got)
+			}
 		}
 	})
 

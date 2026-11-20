@@ -310,7 +310,7 @@ export class Verifier {
   async #jwksUri(): Promise<string> {
     if (this.#jwksUrl !== undefined) return this.#jwksUrl;
     if (this.#resolvedJwksUrl !== undefined) return this.#resolvedJwksUrl;
-    const url = `${this.issuer.replace(/\/+$/u, "")}/.well-known/openid-configuration`;
+    const url = `${trimTrailingSlashes(this.issuer)}/.well-known/openid-configuration`;
     const doc = await this.#getJson(url, "discovery");
     const jwksUri = (doc as { jwks_uri?: unknown } | null)?.jwks_uri;
     if (typeof jwksUri !== "string" || jwksUri === "") {
@@ -341,6 +341,13 @@ export class Verifier {
       throw new UnavailableError(`${operation}: response is not JSON`, { cause: err });
     }
   }
+}
+
+/** `value` without trailing slashes (a loop, not a regex: no backtracking on long inputs). */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return value.slice(0, end);
 }
 
 function checkUrl(name: string, value: string): void {

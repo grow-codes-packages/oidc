@@ -10,6 +10,7 @@ import {
   OidcClient,
   OidcConfig,
   OidcError,
+  relativeEndpoint,
 } from "../src/index.js";
 import { type MockServer, closedPort, startServer } from "./helpers/server.js";
 
@@ -20,9 +21,13 @@ afterEach(async () => {
 
 async function demoServer(token = "t0ken-value"): Promise<MockServer> {
   const s = await startServer((req) => {
-    if (req.url === "/health") return { status: 200, body: { status: "ok", version: "1.2.3" } };
-    if (req.url === "/version") return { status: 200, body: { version: "1.2.3" } };
-    if (req.url === "/v1/ping") {
+    if (req.url === "/.well-known/openid-configuration") {
+      return {
+        status: 200,
+        body: { issuer: "http://idp.test", userinfo_endpoint: "http://idp.test/api/userinfo" },
+      };
+    }
+    if (req.url === "/api/userinfo") {
       return req.headers.authorization === `Bearer ${token}`
         ? { status: 200, body: { pong: true } }
         : { status: 401, body: { message: "bad token" } };
@@ -138,16 +143,16 @@ describe("OidcConfig", () => {
 });
 
 describe("OidcClient", () => {
-  it("health, ping and serverVersion against the demo API", async () => {
+  it("health, ping and serverVersion against a provider", async () => {
     const s = await demoServer();
     const client = new OidcClient({ url: s.url, token: "t0ken-value", ...fast });
     expect(await client.health()).toEqual({
       healthy: true,
       status: "ok",
-      details: { version: "1.2.3" },
+      details: { issuer: "http://idp.test" },
     });
     expect(await client.ping()).toBeGreaterThanOrEqual(0);
-    expect(await client.serverVersion()).toBe("1.2.3");
+    await expect(client.serverVersion()).rejects.toMatchObject({ code: "UNSUPPORTED" });
     expect(client.transport.userAgent).toContain(`grow-codes-${PACKAGE_KEY}/`);
     await client.close();
   });
@@ -164,39 +169,34 @@ describe("OidcClient", () => {
     await client.close();
   });
 
-  it("serverVersion raises UnsupportedError when absent", async () => {
-    const s = await startServer([{ status: 404 }]);
+  it("ping raises UnsupportedError without a userinfo endpoint", async () => {
+    const s = await startServer([{ status: 200, body: { issuer: "x" } }]);
     servers.push(s);
     const client = new OidcClient({ url: s.url, ...fast });
-    await expect(client.serverVersion()).rejects.toMatchObject({ code: "UNSUPPORTED" });
-    const s2 = await startServer([{ status: 200, body: { other: 1 } }]);
-    servers.push(s2);
-    const client2 = new OidcClient({ url: s2.url, ...fast });
-    await expect(client2.serverVersion()).rejects.toMatchObject({ code: "UNSUPPORTED" });
+    await expect(client.ping()).rejects.toMatchObject({ code: "UNSUPPORTED" });
     await client.close();
-    await client2.close();
+    await expect(client.serverVersion()).rejects.toMatchObject({ code: "CANCELLED" });
   });
 
-  it("health reports vendor words and unhealthy statuses", async () => {
-    const s = await startServer((req) =>
-      req.url === "/health"
-        ? { status: 200, body: { status: "degraded" } }
-        : { status: 200, body: "" },
-    );
-    servers.push(s);
-    const degraded = new OidcClient({ url: s.url, ...fast });
-    expect(await degraded.health()).toMatchObject({ healthy: false, status: "degraded" });
-    await degraded.close();
+  it("health reports unhealthy statuses", async () => {
     const empty = await startServer([{ status: 200 }]);
     servers.push(empty);
     const ok = new OidcClient({ url: empty.url, ...fast });
-    expect(await ok.health()).toMatchObject({ healthy: true, status: "ok" });
+    expect(await ok.health()).toMatchObject({ healthy: true, status: "ok", details: {} });
     await ok.close();
     const down = await startServer([{ status: 500 }]);
     servers.push(down);
     const sick = new OidcClient({ url: down.url, ...fast });
     expect(await sick.health()).toMatchObject({ healthy: false, status: "unhealthy" });
     await sick.close();
+  });
+
+  it("relativeEndpoint keeps realm prefixes out", () => {
+    expect(relativeEndpoint("http://kc/realms/x/", "http://kc/realms/x/protocol/userinfo")).toBe(
+      "/protocol/userinfo",
+    );
+    expect(relativeEndpoint("http://a", "http://b/api/userinfo?x=1")).toBe("/api/userinfo?x=1");
+    expect(relativeEndpoint("http://a", "/userinfo")).toBe("/userinfo");
   });
 
   it("core.health.unreachable: closed port -> healthy=false, status=unreachable", async () => {
