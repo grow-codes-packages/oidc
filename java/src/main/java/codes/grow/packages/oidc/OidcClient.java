@@ -13,12 +13,15 @@ import codes.grow.packages.oidc.core.RetryPolicy;
 import codes.grow.packages.oidc.core.Secret;
 import codes.grow.packages.oidc.core.TlsOptions;
 import codes.grow.packages.oidc.core.TransportRequest;
-import codes.grow.packages.oidc.core.TransportResponse;
 import codes.grow.packages.oidc.core.UnsupportedException;
 import com.fasterxml.jackson.databind.JsonNode;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -107,14 +110,18 @@ public final class OidcClient implements AutoCloseable {
     }
   }
 
+  /** Discovery document path, relative to the provider URL. */
+  public static final String DISCOVERY_PATH = ".well-known/openid-configuration";
+
   /**
-   * Checks liveness ({@code GET /health}). Never throws for an unhealthy or unreachable service.
+   * Checks liveness ({@code GET <url>/.well-known/openid-configuration}). Never throws for an
+   * unhealthy or unreachable provider.
    *
    * @return the health status
    * @throws CancelledException when interrupted or closed
    */
   public HealthStatus health() {
-    return HealthCheck.check(transport, "/health");
+    return trim(HealthCheck.check(transport, DISCOVERY_PATH));
   }
 
   /**
@@ -123,14 +130,28 @@ public final class OidcClient implements AutoCloseable {
    * @return a future with the health status
    */
   public CompletableFuture<HealthStatus> healthAsync() {
-    return HealthCheck.checkAsync(transport, "/health");
+    return HealthCheck.checkAsync(transport, DISCOVERY_PATH).thenApply(OidcClient::trim);
+  }
+
+  /** Keeps only the issuer of a healthy discovery document (not every endpoint). */
+  private static HealthStatus trim(HealthStatus h) {
+    if (!h.healthy()) {
+      return h;
+    }
+    Map<String, String> details = new LinkedHashMap<>();
+    if (h.details().containsKey("issuer")) {
+      details.put("issuer", h.details().get("issuer"));
+    }
+    return new HealthStatus(true, h.status(), details);
   }
 
   /**
-   * Performs an authenticated round trip ({@code GET /v1/ping}).
+   * Performs an authenticated round trip with the configured access token: {@code GET} the
+   * provider's {@code userinfo_endpoint} from discovery.
    *
    * @return the latency
-   * @throws AuthenticationException on bad credentials
+   * @throws AuthenticationException for a rejected token
+   * @throws UnsupportedException when the provider has no userinfo endpoint
    */
   public Duration ping() {
     return HttpTransport.await(pingAsync(), "ping");
@@ -144,15 +165,51 @@ public final class OidcClient implements AutoCloseable {
   public CompletableFuture<Duration> pingAsync() {
     long start = System.nanoTime();
     return transport
-        .sendAsync(authorized(TransportRequest.get("/v1/ping").operation("ping")))
+        .sendAsync(TransportRequest.get(DISCOVERY_PATH).operation("ping").build())
+        .thenCompose(
+            doc -> {
+              JsonNode endpoint = doc.jsonNode().get("userinfo_endpoint");
+              if (endpoint == null || !endpoint.isTextual() || endpoint.asText().isEmpty()) {
+                throw new UnsupportedException("ping: the provider has no userinfo endpoint");
+              }
+              String path = relativeEndpoint(config.url(), endpoint.asText());
+              return transport.sendAsync(authorized(TransportRequest.get(path).operation("ping")));
+            })
         .thenApply(r -> Duration.ofNanos(System.nanoTime() - start));
   }
 
   /**
-   * Returns the server version ({@code GET /version}).
+   * Path of an endpoint relative to the provider URL: the part after the provider URL when the
+   * endpoint starts with it (keeps realm prefixes out), else the endpoint's own path and query.
    *
-   * @return the version string
-   * @throws UnsupportedException when the server exposes none
+   * @param base the provider URL
+   * @param endpoint the endpoint URL from discovery
+   * @return the relative path
+   */
+  public static String relativeEndpoint(String base, String endpoint) {
+    String root = base.replaceAll("/+$", "");
+    if (endpoint.startsWith(root + "/")) {
+      return endpoint.substring(root.length());
+    }
+    try {
+      URI uri = new URI(endpoint);
+      if (uri.getRawPath() == null || uri.getRawPath().isEmpty()) {
+        return endpoint;
+      }
+      return uri.getRawQuery() == null
+          ? uri.getRawPath()
+          : uri.getRawPath() + "?" + uri.getRawQuery();
+    } catch (URISyntaxException e) {
+      return endpoint;
+    }
+  }
+
+  /**
+   * OpenID Connect providers expose no version: always {@link UnsupportedException}.
+   *
+   * @return never returns normally
+   * @throws UnsupportedException always while open
+   * @throws CancelledException once closed
    */
   public String serverVersion() {
     return HttpTransport.await(serverVersionAsync(), "serverVersion");
@@ -161,22 +218,15 @@ public final class OidcClient implements AutoCloseable {
   /**
    * Asynchronous {@link #serverVersion()}.
    *
-   * @return a future with the version
+   * @return a future failed with {@link UnsupportedException} ({@link CancelledException} once
+   *     closed)
    */
   public CompletableFuture<String> serverVersionAsync() {
-    return transport
-        .sendAsync(
-            authorized(
-                TransportRequest.get("/version").operation("serverVersion").acceptStatus(404)))
-        .thenApply(OidcClient::version);
-  }
-
-  private static String version(TransportResponse r) {
-    JsonNode v = r.status() == 404 ? null : r.jsonNode().get("version");
-    if (v == null || !v.isTextual()) {
-      throw new UnsupportedException("serverVersion: the server exposes no version");
-    }
-    return v.asText();
+    return CompletableFuture.failedFuture(
+        closed.get()
+            ? new CancelledException("serverVersion: client is closed")
+            : new UnsupportedException(
+                "serverVersion: OpenID Connect providers expose no version"));
   }
 
   private TransportRequest authorized(TransportRequest.Builder b) {

@@ -50,7 +50,7 @@ pub use crate::core::{Error, ErrorCode, HealthStatus, Result, RetryPolicy, Secre
 
 pub use crate::config::DEFAULT_URL;
 
-pub use crate::client::OidcClient;
+pub use crate::client::{relative_endpoint, OidcClient, DISCOVERY_PATH};
 
 pub use crate::config::OidcConfig;
 

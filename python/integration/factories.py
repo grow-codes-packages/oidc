@@ -16,7 +16,7 @@ URL_VAR = "GROW_OIDC_URL"
 
 #: Capabilities of the deployment under test for the core scenarios ("version" = serverVersion,
 #: "auth" = the deployment rejects a wrong token; drop it for services without authentication).
-CORE_CAPABILITIES: set[str] = {"version", "auth"}
+CORE_CAPABILITIES: set[str] = {"auth"}  # no "version": OpenID Connect providers expose none
 
 
 def core_client(env: Mapping[str, str]) -> sdk.OidcClient:

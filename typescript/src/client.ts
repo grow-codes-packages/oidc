@@ -1,5 +1,5 @@
 // Service-owned: generated once by sdk-kit, then maintained in this repository.
-// The skeleton targets the sdk-kit demo server: GET /health, GET /v1/ping, GET /version.
+// The client talks to the OpenID provider itself: discovery for health, userinfo for ping.
 
 import {
   type HealthStatus,
@@ -10,6 +10,24 @@ import {
   probeHealth,
 } from "./core/index.js";
 import { OidcConfig, type OidcConfigOptions } from "./config.js";
+
+/** Discovery document path, relative to the provider URL (keeps realm prefixes such as Keycloak's). */
+export const DISCOVERY_PATH = ".well-known/openid-configuration";
+
+/**
+ * Path of an endpoint relative to the provider URL: the part after the provider URL when the
+ * endpoint starts with it (keeps realm prefixes out), else the endpoint's own path and query.
+ */
+export function relativeEndpoint(base: string, endpoint: string): string {
+  const root = base.replace(/\/+$/u, "");
+  if (endpoint.startsWith(root + "/")) return endpoint.slice(root.length);
+  try {
+    const url = new URL(endpoint);
+    return url.pathname + url.search;
+  } catch {
+    return endpoint;
+  }
+}
 
 /** Per-call options. */
 export interface CallOptions {
@@ -34,8 +52,6 @@ export class OidcClient {
     this.#transport = new HttpTransport({
       ...internals,
       config: cfg,
-      defaultHeaders: (): Record<string, string> =>
-        cfg.token === undefined ? {} : { authorization: `Bearer ${cfg.token.reveal()}` },
       knownSecrets: () => cfg.knownSecrets(),
     });
   }
@@ -51,39 +67,55 @@ export class OidcClient {
   }
 
   /**
-   * Unauthenticated liveness: `GET /health`. Never throws for an unhealthy or unreachable
-   * service (only `CANCELLED` and `CONFIG`).
+   * Unauthenticated liveness: `GET <url>/.well-known/openid-configuration` (healthy when the
+   * discovery document answers 2xx). Never throws for an unhealthy or unreachable provider (only
+   * `CANCELLED` and `CONFIG`).
    */
   health(options: CallOptions = {}): Promise<HealthStatus> {
     return probeHealth(async () => {
-      const res = await this.#transport.get<Record<string, unknown> | undefined>("/health", {
-        operation: "health",
-        ...options,
-      });
-      const { status, ...details } = res.data ?? {};
-      return healthStatus(typeof status === "string" ? status : "ok", details);
+      const doc = await this.#discovery("health", options);
+      const details: Record<string, unknown> = {};
+      if (typeof doc.issuer === "string") details.issuer = doc.issuer;
+      return healthStatus("ok", details);
     });
   }
 
-  /** Authenticated round trip: `GET /v1/ping`. Returns the latency in milliseconds. */
+  /**
+   * Authenticated round trip with the configured access token (`token`): `GET` the provider's
+   * `userinfo_endpoint` from discovery. Returns the latency in milliseconds; a rejected token
+   * raises `AuthenticationError`, a provider without userinfo `UnsupportedError`.
+   */
   async ping(options: CallOptions = {}): Promise<number> {
     const start = performance.now();
-    await this.#transport.get("/v1/ping", { operation: "ping", responseType: "none", ...options });
+    const doc = await this.#discovery("ping", options);
+    if (typeof doc.userinfo_endpoint !== "string" || doc.userinfo_endpoint === "") {
+      throw new UnsupportedError("ping: the provider has no userinfo endpoint");
+    }
+    // Only the userinfo call carries the token (some providers reject discovery with a bad one).
+    const token = this.config.token;
+    await this.#transport.get(relativeEndpoint(this.config.url, doc.userinfo_endpoint), {
+      operation: "ping",
+      responseType: "none",
+      headers: token === undefined ? {} : { authorization: `Bearer ${token.reveal()}` },
+      ...options,
+    });
     return performance.now() - start;
   }
 
-  /** Server version: `GET /version` → `{"version": "x.y.z"}`. */
-  async serverVersion(options: CallOptions = {}): Promise<string> {
-    const res = await this.#transport.get<{ version?: unknown } | undefined>("/version", {
-      operation: "serverVersion",
-      allowStatus: [404],
-      ...options,
+  /** OpenID Connect has no version endpoint: always `UnsupportedError` (`CANCELLED` once closed). */
+  serverVersion(_options: CallOptions = {}): Promise<string> {
+    return new Promise((_resolve, reject) => {
+      this.#transport.ensureOpen("serverVersion");
+      reject(new UnsupportedError("serverVersion: OpenID Connect providers expose no version"));
     });
-    const version = res.data?.version;
-    if (res.status === 404 || typeof version !== "string") {
-      throw new UnsupportedError("serverVersion: the service does not report a version");
-    }
-    return version;
+  }
+
+  async #discovery(operation: string, options: CallOptions): Promise<Record<string, unknown>> {
+    const res = await this.#transport.get(DISCOVERY_PATH, { operation, ...options });
+    const data = res.data;
+    return data !== null && typeof data === "object" && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : {};
   }
 
   /** Releases connections. Idempotent. */

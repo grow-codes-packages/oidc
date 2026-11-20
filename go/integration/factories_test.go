@@ -11,7 +11,7 @@ import (
 
 // capabilities the deployment under test offers (see conformance "requires").
 // Every capability left out must be justified in docs/compatibility.md.
-var capabilities = []string{"version"}
+var capabilities = []string{} // no "version": OpenID Connect providers expose none
 
 // categories runs "core" plus this service's categories.
 func categories() []string {

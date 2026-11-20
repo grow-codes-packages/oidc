@@ -51,28 +51,29 @@ class OidcClientTest {
         .build();
   }
 
+  private String discovery() {
+    return "{\"issuer\":\"http://idp.test\",\"userinfo_endpoint\":\""
+        + server.url()
+        + "/api/userinfo?schema=openid\"}";
+  }
+
   @Test
   void healthVariants() {
     server
-        .enqueue(200, "{\"status\":\"ok\",\"version\":\"1.0\",\"nested\":{}}")
-        .enqueue(200, "{\"status\":\"degraded\"}")
+        .enqueue(200, "{\"issuer\":\"http://idp.test\",\"jwks_uri\":\"x\",\"n\":{}}")
         .enqueue(503, "{\"status\":\"sealed\"}")
         .enqueue(500, "oops")
-        .enqueue(200, "[1]")
-        .enqueue(200, "{\"status\":5}");
+        .enqueue(200, "[1]");
     try (var c = client()) {
       HealthStatus h = c.health();
-      assertThat(h).isEqualTo(new HealthStatus(true, "ok", Map.of("version", "1.0")));
-      assertThat(c.health().status()).isEqualTo("degraded");
+      assertThat(h).isEqualTo(new HealthStatus(true, "ok", Map.of("issuer", "http://idp.test")));
       HealthStatus sealed = c.health();
       assertThat(sealed.healthy()).isFalse();
-      assertThat(sealed.status()).isEqualTo("sealed");
       assertThat(sealed.details()).containsEntry("httpStatus", "503");
       assertThat(c.health().status()).isEqualTo("unhealthy");
-      assertThat(c.health().status()).isEqualTo("ok");
-      assertThat(c.healthAsync().join().details()).containsEntry("status", "5");
-      assertThat(server.requests()).hasSize(6);
-      assertThat(server.requests().get(0).uri()).isEqualTo("/health");
+      assertThat(c.healthAsync().join()).isEqualTo(new HealthStatus(true, "ok", Map.of()));
+      assertThat(server.requests()).hasSize(4);
+      assertThat(server.requests().get(0).uri()).isEqualTo("/.well-known/openid-configuration");
     }
   }
 
@@ -100,15 +101,19 @@ class OidcClientTest {
   }
 
   @Test
-  void pingSendsBearerToken() {
+  void pingSendsBearerTokenToUserinfo() {
     server
+        .enqueue(200, discovery())
         .enqueue(200, "{}")
+        .enqueue(200, discovery())
         .enqueue(401, "{\"message\":\"bad token tok-123456\"}")
+        .enqueue(200, discovery())
         .enqueue(200, "{}");
     try (var c = client()) {
       assertThat(c.ping()).isPositive();
-      assertThat(server.requests().get(0).header("Authorization")).isEqualTo("Bearer tok-123456");
-      assertThat(server.requests().get(0).uri()).isEqualTo("/v1/ping");
+      assertThat(server.requests().get(0).header("Authorization")).isNull();
+      assertThat(server.requests().get(1).header("Authorization")).isEqualTo("Bearer tok-123456");
+      assertThat(server.requests().get(1).uri()).isEqualTo("/api/userinfo?schema=openid");
       assertThatThrownBy(c::ping)
           .isInstanceOf(AuthenticationException.class)
           .message()
@@ -118,27 +123,35 @@ class OidcClientTest {
   }
 
   @Test
-  void pingWithoutToken() {
-    server.enqueue(200, "{}");
+  void pingWithoutTokenOrUserinfo() {
+    server.enqueue(200, discovery()).enqueue(200, "{}").enqueue(200, "{\"issuer\":\"x\"}");
     try (var c = OidcClient.builder().url(server.url()).build()) {
       c.ping();
-      assertThat(server.requests().get(0).header("Authorization")).isNull();
+      assertThat(server.requests().get(1).header("Authorization")).isNull();
+      assertThatThrownBy(c::ping).isInstanceOf(UnsupportedException.class);
     }
   }
 
   @Test
-  void serverVersion() {
-    server
-        .enqueue(200, "{\"version\":\"1.2.3\"}")
-        .enqueue(404, "")
-        .enqueue(200, "{\"other\":1}")
-        .enqueue(200, "{\"version\":\"2.0.0\"}");
-    try (var c = client()) {
-      assertThat(c.serverVersion()).isEqualTo("1.2.3");
-      assertThatThrownBy(c::serverVersion).isInstanceOf(UnsupportedException.class);
-      assertThatThrownBy(c::serverVersion).isInstanceOf(UnsupportedException.class);
-      assertThat(c.serverVersionAsync().join()).isEqualTo("2.0.0");
-    }
+  void serverVersionIsUnsupported() {
+    OidcClient c = client();
+    assertThatThrownBy(c::serverVersion).isInstanceOf(UnsupportedException.class);
+    assertThatThrownBy(() -> c.serverVersionAsync().join())
+        .hasCauseInstanceOf(UnsupportedException.class);
+    c.close();
+    assertThatThrownBy(c::serverVersion).isInstanceOf(CancelledException.class);
+    assertThat(server.requests()).isEmpty();
+  }
+
+  @Test
+  void relativeEndpoints() {
+    assertThat(OidcClient.relativeEndpoint("http://kc/realms/x/", "http://kc/realms/x/p/ui"))
+        .isEqualTo("/p/ui");
+    assertThat(OidcClient.relativeEndpoint("http://a", "http://b/api/u?x=1"))
+        .isEqualTo("/api/u?x=1");
+    assertThat(OidcClient.relativeEndpoint("http://a", "http://b/api/u")).isEqualTo("/api/u");
+    assertThat(OidcClient.relativeEndpoint("http://a", "mailto:x")).isEqualTo("mailto:x");
+    assertThat(OidcClient.relativeEndpoint("http://a", "::bad")).isEqualTo("::bad");
   }
 
   @Test

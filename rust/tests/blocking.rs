@@ -36,15 +36,18 @@ fn serve(responses: Vec<&'static str>) -> String {
 #[test]
 fn blocking_client() {
     let url = serve(vec![
-        r#"200 {"status":"ok"}"#,
-        r#"200 {"pong":true}"#,
-        r#"200 {"version":"2.0.0"}"#,
+        r#"200 {"issuer":"x"}"#,
+        r#"200 {"userinfo_endpoint":"/api/userinfo"}"#,
+        r#"200 {"sub":"u"}"#,
     ]);
     let cfg = Config::builder().url(url).token("t-1234").build().unwrap();
     let c = Client::new(cfg).unwrap();
     assert!(c.health().unwrap().healthy);
     c.ping().unwrap();
-    assert_eq!(c.server_version().unwrap(), "2.0.0");
+    assert_eq!(
+        c.server_version().unwrap_err().code(),
+        ErrorCode::Unsupported
+    );
     assert!(!c.async_client().is_closed());
     assert_eq!(c.block_on(async { 7 }), 7);
     // background tasks keep running between blocking calls (one worker thread)

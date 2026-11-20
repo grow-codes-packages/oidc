@@ -14,7 +14,7 @@ import codes.grow.packages.oidc.testing.ConformanceRunner;
  */
 final class Factories {
   /** Capabilities the deployment under test offers (see the scenario {@code requires}). */
-  static final String[] CAPABILITIES = {"version"};
+  static final String[] CAPABILITIES = {}; // no "version": OpenID Connect providers expose none
 
   private Factories() {}
 

@@ -48,10 +48,14 @@ test("ping with a wrong token raises AUTHENTICATION and never leaks it", async (
   }
 });
 
-test("serverVersion returns a version string", async () => {
+test("serverVersion is UNSUPPORTED (OIDC has no version endpoint)", async () => {
   const client = OidcClient.fromEnv();
   try {
-    assert.match(await client.serverVersion(), /\S/);
+    await assert.rejects(client.serverVersion(), (err: unknown) => {
+      assert.ok(err instanceof OidcError);
+      assert.equal(err.code, "UNSUPPORTED");
+      return true;
+    });
   } finally {
     await client.close();
     await client.close();

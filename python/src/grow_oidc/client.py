@@ -1,8 +1,8 @@
 """OIDC clients (sync and async).
 
-This file is owned by the service package (generated once by sdk-kit). The skeleton talks to
-``GET /health``, ``GET /v1/ping`` and ``GET /version``; replace the paths with the service API
-and hang service modules off the client (``client.kv`` …).
+This file is owned by the service package (generated once by sdk-kit). The client talks to the
+OpenID provider itself: ``health`` reads the discovery document, ``ping`` calls the provider's
+``userinfo_endpoint`` with the configured access token; OpenID Connect has no version endpoint.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from ._core import (
     ConfigError,
     HealthStatus,
     HttpTransport,
-    NotFoundError,
     Request,
     ResourceRegistry,
     Response,
@@ -33,11 +32,41 @@ from ._core import (
 )
 from .config import OidcConfig
 
-__all__ = ["OidcClient", "AsyncOidcClient"]
+__all__ = ["DISCOVERY_PATH", "AsyncOidcClient", "OidcClient", "relative_endpoint"]
 
-_HEALTH = Request("GET", "/health", operation="health", raise_for_status=False, max_retries=0)
-_PING = "/v1/ping"
-_VERSION = "/version"
+#: Discovery document path, relative to the provider URL (realm prefixes such as Keycloak's kept).
+DISCOVERY_PATH = ".well-known/openid-configuration"
+_HEALTH = Request("GET", DISCOVERY_PATH, operation="health", raise_for_status=False, max_retries=0)
+_DISCOVERY = Request("GET", DISCOVERY_PATH, operation="ping")
+_NO_VERSION = "server_version: OpenID Connect providers expose no version"
+
+
+def relative_endpoint(base: str, endpoint: str) -> str:
+    """Path of ``endpoint`` relative to the provider URL ``base``.
+
+    The part after ``base`` when the endpoint starts with it (keeps realm prefixes out), else the
+    endpoint's own path and query.
+    """
+    root = base.rstrip("/")
+    if endpoint.startswith(root + "/"):
+        return endpoint[len(root) :]
+    parsed = httpx.URL(endpoint)
+    path = parsed.path or endpoint
+    query = parsed.query.decode()
+    return f"{path}?{query}" if query else path
+
+
+def _userinfo(resp: Response, config: OidcConfig) -> Request:
+    body: Any = resp.json()
+    endpoint = body.get("userinfo_endpoint") if isinstance(body, Mapping) else None
+    if not isinstance(endpoint, str) or not endpoint:
+        raise UnsupportedError("ping: the provider has no userinfo endpoint")
+    return Request(
+        "GET",
+        relative_endpoint(config.url, endpoint),
+        operation="ping",
+        headers=_auth_headers(config),
+    )
 
 
 def _auth_headers(config: OidcConfig) -> dict[str, str]:
@@ -53,12 +82,8 @@ def _health_from_response(resp: Response) -> HealthStatus:
         body: Any = resp.json()
     except ValidationError:
         body = None
-    if isinstance(body, Mapping):
-        for key, value in body.items():
-            if key == "status" and isinstance(value, str) and value:
-                status = value
-            elif isinstance(value, (str, int, float, bool)):
-                details[str(key)] = str(value)
+    if isinstance(body, Mapping) and isinstance(body.get("issuer"), str):
+        details["issuer"] = body["issuer"]
     if not resp.ok:
         details.setdefault("httpStatus", str(resp.status))
     return HealthStatus(healthy=resp.ok, status=status, details=details)
@@ -69,24 +94,6 @@ def _health_from_error(err: ServiceError) -> HealthStatus:
         raise err
     word = "unreachable" if isinstance(err, (UnavailableError, TimeoutError)) else "unhealthy"
     return HealthStatus(healthy=False, status=word, details={"error": err.message})
-
-
-def _version_from_response(resp: Response) -> str:
-    body = resp.json()
-    version = body.get("version") if isinstance(body, Mapping) else None
-    if not isinstance(version, str) or not version:
-        raise ValidationError("server_version: response has no version")
-    return version
-
-
-def _unsupported_version(err: ServiceError) -> ServiceError:
-    if isinstance(err, NotFoundError):
-        return UnsupportedError(
-            "server_version: not exposed by this deployment",
-            http_status=err.http_status,
-            request_id=err.request_id,
-        )
-    return err
 
 
 class OidcClient:
@@ -137,23 +144,21 @@ class OidcClient:
         return _health_from_response(resp)
 
     def ping(self, *, cancel: CancelToken | None = None) -> float:
-        """Authenticated round trip; returns the latency in milliseconds."""
+        """Authenticated round trip (userinfo with the configured token); latency in ms.
+
+        :class:`AuthenticationError` for a rejected token, :class:`UnsupportedError` when the
+        provider has no userinfo endpoint.
+        """
         started = time.monotonic()
-        self._transport.request(
-            Request("GET", _PING, operation="ping", headers=_auth_headers(self.config)),
-            cancel=cancel,
-        )
+        discovery = self._transport.request(_DISCOVERY, cancel=cancel)
+        self._transport.request(_userinfo(discovery, self.config), cancel=cancel)
         return (time.monotonic() - started) * 1000.0
 
     def server_version(self, *, cancel: CancelToken | None = None) -> str:
-        """The server version; :class:`UnsupportedError` when the service exposes none."""
-        try:
-            resp = self._transport.request(
-                Request("GET", _VERSION, operation="server_version"), cancel=cancel
-            )
-        except ServiceError as err:
-            raise _unsupported_version(err) from None
-        return _version_from_response(resp)
+        """Always :class:`UnsupportedError` (``CancelledError`` once closed)."""
+        if self._transport.closed:
+            raise CancelledError("server_version: client is closed")
+        raise UnsupportedError(_NO_VERSION)
 
     def close(self) -> None:
         """Stop watchers/renewers and close connections (idempotent)."""
@@ -220,19 +225,14 @@ class AsyncOidcClient:
 
     async def ping(self) -> float:
         started = time.monotonic()
-        await self._transport.request(
-            Request("GET", _PING, operation="ping", headers=_auth_headers(self.config))
-        )
+        discovery = await self._transport.request(_DISCOVERY)
+        await self._transport.request(_userinfo(discovery, self.config))
         return (time.monotonic() - started) * 1000.0
 
     async def server_version(self) -> str:
-        try:
-            resp = await self._transport.request(
-                Request("GET", _VERSION, operation="server_version")
-            )
-        except ServiceError as err:
-            raise _unsupported_version(err) from None
-        return _version_from_response(resp)
+        if self._transport.closed:
+            raise CancelledError("server_version: client is closed")
+        raise UnsupportedError(_NO_VERSION)
 
     async def aclose(self) -> None:
         """Stop watchers/renewers and close connections (idempotent)."""

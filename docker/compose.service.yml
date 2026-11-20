@@ -1,7 +1,7 @@
 # The service under test for the Docker integration suites (sdk-kit SPEC §8).
 #
 # OWNED BY THIS REPOSITORY. sdk-kit writes this file once (`sdk-kit new`) and never overwrites it.
-# Replace the placeholder below with the real deployment of OIDC (image tag = stack catalog,
+# The OpenID provider under test is Casdoor (the stack catalog default auth option) (image tag = stack catalog,
 # extra containers such as databases are fine). Keep these names, docker/compose.yml relies on them:
 #   service     the endpoint the SDK talks to (GROW_OIDC_URL=http://service:8000);
 #               it must have a healthcheck
@@ -11,15 +11,36 @@
 # (moto, fakeintake, betterstack-stub).
 
 services:
-  # --- SERVICE: replace with the real service ---------------------------------------------------
+  # --- SERVICE: Casdoor (stack catalog default auth option) + PostgreSQL ---------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: casdoor-test-db   # throwaway test container, never a real secret
+      POSTGRES_DB: casdoor
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d casdoor"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
   service:
     image: casbin/casdoor:v4.27.1
+    command: ["--createDatabase=true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      driverName: postgres
+      dataSourceName: "user=postgres password=casdoor-test-db host=postgres port=5432 sslmode=disable dbname=casdoor"
+      dbName: casdoor
+      runmode: prod
+      # built-in/admin password of the throwaway test instance (only applied on the first start)
+      initAdminPassword: casdoor-test-admin-1
     networks:
       default:
         aliases: [oidc]
     healthcheck:
-      # Replace with the service's own readiness probe (an HTTP health endpoint or CLI status).
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8000/ || curl -fsS -o /dev/null http://127.0.0.1:8000/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8000/api/health | grep -q '\"ok\"'"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -27,8 +48,10 @@ services:
       start_interval: 1s
   # --- end SERVICE ---------------------------------------------------------------------------------
 
+  # Creates an organization, application, role and user in Casdoor and mints a real access token
+  # (docker/bootstrap/mint.py). Tokens carry iss=http://service:8000 because they are minted there.
   bootstrap:
-    image: alpine:3.24.4
+    image: python:3.13-alpine
     depends_on:
       service:
         condition: service_healthy
@@ -38,6 +61,7 @@ services:
       - ./harness:/harness:ro
     environment:
       SERVICE_URL: http://service:8000
+      CASDOOR_ADMIN_PASSWORD: casdoor-test-admin-1
     entrypoint: ["/bin/sh", "/scripts/bootstrap.sh"]
     restart: "no"
 

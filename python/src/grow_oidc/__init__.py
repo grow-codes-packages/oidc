@@ -8,7 +8,7 @@
 from . import _core
 from ._core import *  # noqa: F403
 from ._version import __version__
-from .client import AsyncOidcClient, OidcClient
+from .client import DISCOVERY_PATH, AsyncOidcClient, OidcClient, relative_endpoint
 from .config import DEFAULT_URL, OidcConfig
 from .integrations import (
     DjangoOidcMiddleware,
@@ -36,6 +36,8 @@ __all__ = [
     "AsyncOidcClient",
     "OidcConfig",
     "DEFAULT_URL",
+    "DISCOVERY_PATH",
+    "relative_endpoint",
     "Verifier",
     "AuthUser",
     "bearer_token",
