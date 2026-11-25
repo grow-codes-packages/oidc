@@ -74,7 +74,8 @@ func (u *User) HasRole(roles ...string) bool {
 
 // Options configures a Verifier. Zero values select the defaults.
 type Options struct {
-	// Issuer is the expected "iss" (exact match); discovery uses <Issuer>/.well-known/openid-configuration.
+	// Issuer is the expected "iss" (exact match, except that trailing slashes on either side are
+	// ignored); discovery uses <Issuer without trailing slashes>/.well-known/openid-configuration.
 	Issuer string
 	// Audience is the expected "aud" (the token's aud must contain it).
 	Audience string
@@ -101,7 +102,7 @@ type Options struct {
 //
 // It checks the signature (RS256/384/512, PS256/384/512, ES256/384/512, EdDSA allow-list; the key
 // must match the algorithm: RSA for RS and PS, the EC curve P-256/P-384/P-521 for ES256/384/512,
-// Ed25519 for EdDSA), iss (exact), aud (contains), exp
+// Ed25519 for EdDSA), iss (exact, trailing slashes ignored), aud (contains), exp
 // (required), nbf and sub with a clock skew (default 60 s). Keys come from JWKSURL or OIDC
 // discovery, are cached (default 10 min) and refetched when a token names an unknown kid (key
 // rotation, at most once per cooldown).
@@ -355,7 +356,9 @@ func numericClaim(claims map[string]any, name string) (float64, bool, error) {
 }
 
 func (v *Verifier) checkClaims(claims map[string]any) error {
-	if iss, _ := claims["iss"].(string); iss != v.issuer {
+	// Exact match except trailing slashes (Authentik's iss always ends with "/").
+	iss, ok := claims["iss"].(string)
+	if !ok || strings.TrimRight(iss, "/") != strings.TrimRight(v.issuer, "/") {
 		return authErr("claim iss is invalid (unexpected value)")
 	}
 	if !audienceContains(claims["aud"], v.audience) {

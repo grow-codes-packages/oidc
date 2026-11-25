@@ -301,7 +301,9 @@ class Verifier:
         return self._to_user(claims)
 
     def _check_claims(self, claims: Mapping[str, Any]) -> None:
-        if claims.get("iss") != self.issuer:
+        # Exact match except trailing slashes (Authentik's ``iss`` always ends with "/").
+        iss = claims.get("iss")
+        if not isinstance(iss, str) or iss.rstrip("/") != self.issuer.rstrip("/"):
             raise AuthenticationError("verify: claim iss is invalid (unexpected value)")
         aud = claims.get("aud")
         if not (aud == self.audience or (isinstance(aud, list) and self.audience in aud)):

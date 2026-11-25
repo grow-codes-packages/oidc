@@ -549,3 +549,105 @@ fn bearer_tokens() {
     assert_eq!(bearer_token("Bearer a b"), None);
     assert_eq!(bearer_token(""), None);
 }
+
+/// A discovery-only IdP at `<server>/application/o/app` (Authentik layout) whose discovery
+/// document names `doc_issuer` and points at the fake IdP's JWKS.
+async fn authentik_discovery(idp: &FakeIdp, doc_issuer_slash: bool) -> (MockServer, String) {
+    use wiremock::matchers::{method, path};
+    let server = MockServer::start().await;
+    let issuer = format!("{}/application/o/app", server.uri());
+    let doc_issuer = if doc_issuer_slash {
+        format!("{issuer}/")
+    } else {
+        issuer.clone()
+    };
+    Mock::given(method("GET"))
+        .and(path("/application/o/app/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "issuer": doc_issuer, "jwks_uri": format!("{}/jwks", idp.issuer) }),
+        ))
+        .mount(&server)
+        .await;
+    (server, issuer)
+}
+
+fn with_issuer(idp: &FakeIdp, issuer: &str) -> Verifier {
+    Verifier::new(VerifierOptions {
+        issuer: issuer.into(),
+        ..opts(idp)
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn oidc_20_issuer_trailing_slashes() {
+    let idp = FakeIdp::start("app-client", "RS256").await;
+
+    // (1) Token iss with a trailing slash, configured issuer without one (Authentik).
+    let token = idp.mint(json!({ "iss": format!("{}/", idp.issuer) }));
+    assert_eq!(verifier(&idp).verify(&token).await.unwrap().sub, "user-1");
+
+    // (2) Configured issuer with trailing slashes, token iss without one; discovery URL has no "//".
+    let slashed = with_issuer(&idp, &format!("{}//", idp.issuer));
+    assert_eq!(
+        slashed.verify(&idp.mint(json!({}))).await.unwrap().sub,
+        "user-1"
+    );
+    assert_eq!(idp.hits("/.well-known/openid-configuration").await, 2);
+    let requests = idp.server.received_requests().await.unwrap_or_default();
+    assert!(requests.iter().all(|r| !r.url.path().contains("//")));
+
+    // (3) Discovery document issuer with and without a trailing slash; issuer with a path.
+    for doc_slash in [true, false] {
+        let (disc, issuer) = authentik_discovery(&idp, doc_slash).await;
+        for (configured, iss) in [
+            (issuer.clone(), format!("{issuer}/")),
+            (format!("{issuer}/"), issuer.clone()),
+            (format!("{issuer}/"), format!("{issuer}/")),
+        ] {
+            let v = with_issuer(&idp, &configured);
+            let user = v.verify(&idp.mint(json!({ "iss": iss }))).await.unwrap();
+            assert_eq!(user.sub, "user-1");
+        }
+        let paths: Vec<String> = disc
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_owned())
+            .collect();
+        assert!(paths
+            .iter()
+            .all(|p| p == "/application/o/app/.well-known/openid-configuration"));
+        // Everything but trailing slashes stays exact: path case, extra segments.
+        let v = with_issuer(&idp, &issuer);
+        let upper = issuer.replace("/application/", "/Application/");
+        auth_err(&v, &idp.mint(json!({ "iss": format!("{upper}/") })), "iss").await;
+        auth_err(
+            &v,
+            &idp.mint(json!({ "iss": format!("{issuer}/x/") })),
+            "iss",
+        )
+        .await;
+        auth_err(&v, &idp.mint(json!({ "iss": format!("{issuer}x") })), "iss").await;
+    }
+
+    // (4) Different path, host, port, scheme or a missing iss is still rejected.
+    let v = verifier(&idp);
+    let port: u16 = idp.issuer.rsplit(':').next().unwrap().parse().unwrap();
+    for iss in [
+        format!("{}/other", idp.issuer),
+        format!("{}/other/", idp.issuer),
+        idp.issuer.replace("127.0.0.1", "localhost"),
+        idp.issuer
+            .replace(&format!(":{port}"), &format!(":{}", port.wrapping_add(1))),
+        idp.issuer.replace("http://", "https://"),
+        format!("{}/", idp.issuer.replace("http://", "https://")),
+        idp.issuer.to_uppercase(),
+    ] {
+        auth_err(&v, &idp.mint(json!({ "iss": iss })), "claim iss").await;
+    }
+    auth_err(&v, &idp.mint(json!({ "iss": null })), "claim iss").await;
+    auth_err(&v, &idp.mint(json!({ "iss": 42 })), "claim iss").await;
+    auth_err(&v, &idp.mint(json!({ "iss": "/" })), "claim iss").await;
+}

@@ -58,7 +58,8 @@ pub type ClockFn = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 /// Options of a [`Verifier`]. `Default` gives the documented defaults (issuer/audience empty).
 #[derive(Clone)]
 pub struct VerifierOptions {
-    /// Expected `iss` (exact); discovery uses `<issuer>/.well-known/openid-configuration`.
+    /// Expected `iss` (exact, except that trailing slashes on either side are ignored); discovery
+    /// uses `<issuer without trailing slashes>/.well-known/openid-configuration`.
     pub issuer: String,
     /// Expected `aud` (the token's `aud` must contain it).
     pub audience: String,
@@ -456,7 +457,9 @@ impl Verifier {
 
     fn check_claims(&self, claims: &Map<String, Value>) -> Result<()> {
         let i = &self.inner;
-        if claims.get("iss").and_then(Value::as_str) != Some(i.issuer.as_str()) {
+        // Exact match except trailing slashes (Authentik's `iss` always ends with "/").
+        let iss = claims.get("iss").and_then(Value::as_str);
+        if iss.map(|s| s.trim_end_matches('/')) != Some(i.issuer.trim_end_matches('/')) {
             return Err(auth("claim iss is invalid (unexpected value)"));
         }
         let aud_ok = match claims.get("aud") {
