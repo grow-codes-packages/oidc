@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/grow-codes-packages/oidc/compare/java-v0.1.0...java-v0.1.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* accept ES384/ES512/PS*/RS384/RS512 token signatures (Logto) ([#8](https://github.com/grow-codes-packages/oidc/issues/8)) ([60aa8c0](https://github.com/grow-codes-packages/oidc/commit/60aa8c0ac9abc5a13d3d5bed842c7149eaaed392))
+
 ## 0.1.0 (2026-11-20)
 
 
