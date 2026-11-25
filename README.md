@@ -15,7 +15,8 @@
 | Java | [![Maven Central](https://img.shields.io/maven-central/v/codes.grow.packages/oidc)](https://central.sonatype.com/artifact/codes.grow.packages/oidc) | [![Java coverage](https://img.shields.io/endpoint?url=https://grow-codes-packages.github.io/oidc/badges/coverage-java.json)](https://github.com/grow-codes-packages/oidc/actions/workflows/ci.yml) |
 
 Provider-neutral **OpenID Connect access-token verification** in **TypeScript, Rust, Go, Python and
-Java** — one API, five idiomatic packages: JWKS discovery, caching and key rotation, RS256/ES256/EdDSA,
+Java** — one API, five idiomatic packages: JWKS discovery, caching and key rotation,
+RS256/384/512, PS256/384/512, ES256/384/512 and EdDSA (Rust: no ES512; Logto's ES384 default works),
 `iss`/`aud`/`exp`/`nbf` checks with 60 s clock skew, roles from a configurable claim (Casdoor role
 objects included) and framework adapters (Express, NestJS, net/http, FastAPI, ASGI, Django, Jakarta
 Servlet, tower/axum). Configured from `GROW_AUTH_*`. See [docs/verification.md](docs/verification.md).

@@ -1,7 +1,8 @@
 //! Provider-neutral OIDC access-token verification (service-owned).
 //!
-//! JWKS discovery, caching and rotation; RS256/ES256/EdDSA (via `ring`); `iss`/`aud`/`exp`/`nbf`
-//! checks with a clock skew (default 60 s); roles from a configurable claim.
+//! JWKS discovery, caching and rotation; RS256/384/512, PS256/384/512, ES256, ES384 and EdDSA (via
+//! `ring`, which has no P-521, so ES512 is not supported); `iss`/`aud`/`exp`/`nbf` checks with a
+//! clock skew (default 60 s); roles from a configurable claim.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -15,8 +16,11 @@ use serde_json::{Map, Value};
 
 use crate::core::{Error, ErrorCode, Result};
 
-/// Accepted algorithms by default (asymmetric only; `none` and HMAC are never accepted).
-pub const DEFAULT_ALGORITHMS: [&str; 3] = ["RS256", "ES256", "EdDSA"];
+/// Accepted algorithms by default: every supported one (asymmetric only; `none` and HMAC are never
+/// accepted). ES512 is not supported (`ring` has no P-521).
+pub const DEFAULT_ALGORITHMS: [&str; 9] = [
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA",
+];
 /// Default tolerance applied to `exp` and `nbf`.
 pub const DEFAULT_CLOCK_SKEW: Duration = Duration::from_secs(60);
 /// Default JWKS cache lifetime.
@@ -62,7 +66,7 @@ pub struct VerifierOptions {
     pub jwks_url: Option<String>,
     /// Claim (or dotted path such as `realm_access.roles`) with the roles; default `roles`.
     pub roles_claim: Option<String>,
-    /// Allow-list, a subset of RS256, ES256, EdDSA; empty = all three.
+    /// Allow-list, a subset of [`DEFAULT_ALGORITHMS`]; empty = all of them.
     pub algorithms: Vec<String>,
     /// `exp`/`nbf` tolerance (default 60 s).
     pub clock_skew: Duration,
@@ -117,11 +121,51 @@ struct Key {
     kind: KeyKind,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Curve {
+    P256,
+    P384,
+}
+
 #[derive(Clone)]
 enum KeyKind {
     Rsa { n: Vec<u8>, e: Vec<u8> },
-    Ec(Vec<u8>),
+    Ec { curve: Curve, point: Vec<u8> },
     Ed(Vec<u8>),
+}
+
+/// How `ring` verifies one algorithm.
+enum Verification {
+    Rsa(&'static signature::RsaParameters),
+    Raw(&'static dyn signature::VerificationAlgorithm),
+}
+
+/// The `ring` verification for `alg` with a key of `kind`, or `None` when the key type (and the
+/// curve of an EC key) does not match `alg`: the token header never picks a mismatching algorithm.
+fn verification(kind: &KeyKind, alg: &str) -> Option<Verification> {
+    use Verification::{Raw, Rsa};
+    Some(match (kind, alg) {
+        (KeyKind::Rsa { .. }, "RS256") => Rsa(&signature::RSA_PKCS1_2048_8192_SHA256),
+        (KeyKind::Rsa { .. }, "RS384") => Rsa(&signature::RSA_PKCS1_2048_8192_SHA384),
+        (KeyKind::Rsa { .. }, "RS512") => Rsa(&signature::RSA_PKCS1_2048_8192_SHA512),
+        (KeyKind::Rsa { .. }, "PS256") => Rsa(&signature::RSA_PSS_2048_8192_SHA256),
+        (KeyKind::Rsa { .. }, "PS384") => Rsa(&signature::RSA_PSS_2048_8192_SHA384),
+        (KeyKind::Rsa { .. }, "PS512") => Rsa(&signature::RSA_PSS_2048_8192_SHA512),
+        (
+            KeyKind::Ec {
+                curve: Curve::P256, ..
+            },
+            "ES256",
+        ) => Raw(&signature::ECDSA_P256_SHA256_FIXED),
+        (
+            KeyKind::Ec {
+                curve: Curve::P384, ..
+            },
+            "ES384",
+        ) => Raw(&signature::ECDSA_P384_SHA384_FIXED),
+        (KeyKind::Ed(_), "EdDSA") => Raw(&signature::ED25519),
+        _ => return None,
+    })
 }
 
 impl Key {
@@ -129,25 +173,23 @@ impl Key {
         if self.usage.as_deref() == Some("enc") || self.alg.as_deref().is_some_and(|a| a != alg) {
             return false;
         }
-        matches!(
-            (&self.kind, alg),
-            (KeyKind::Rsa { .. }, "RS256") | (KeyKind::Ec(_), "ES256") | (KeyKind::Ed(_), "EdDSA")
-        )
+        verification(&self.kind, alg).is_some()
     }
 
-    fn verify(&self, signed: &[u8], sig: &[u8]) -> bool {
-        match &self.kind {
-            KeyKind::Rsa { n, e } => signature::RsaPublicKeyComponents { n, e }
-                .verify(&signature::RSA_PKCS1_2048_8192_SHA256, signed, sig)
-                .is_ok(),
-            KeyKind::Ec(point) => {
-                UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, point)
-                    .verify(signed, sig)
+    fn verify(&self, alg: &str, signed: &[u8], sig: &[u8]) -> bool {
+        match (verification(&self.kind, alg), &self.kind) {
+            (Some(Verification::Rsa(params)), KeyKind::Rsa { n, e }) => {
+                signature::RsaPublicKeyComponents { n, e }
+                    .verify(params, signed, sig)
                     .is_ok()
             }
-            KeyKind::Ed(x) => UnparsedPublicKey::new(&signature::ED25519, x)
+            (
+                Some(Verification::Raw(algorithm)),
+                KeyKind::Ec { point: bytes, .. } | KeyKind::Ed(bytes),
+            ) => UnparsedPublicKey::new(algorithm, bytes)
                 .verify(signed, sig)
                 .is_ok(),
+            _ => false,
         }
     }
 }
@@ -165,15 +207,20 @@ fn parse_key(raw: &Value) -> Option<Key> {
             let (n, e) = (field("n")?, field("e")?);
             (n.len() >= 256 && !e.is_empty()).then_some(KeyKind::Rsa { n, e })?
         }
-        (Some("EC"), Some("P-256")) => {
+        (Some("EC"), Some(crv @ ("P-256" | "P-384"))) => {
+            let (curve, size) = if crv == "P-256" {
+                (Curve::P256, 32)
+            } else {
+                (Curve::P384, 48)
+            };
             let (x, y) = (field("x")?, field("y")?);
-            if x.len() != 32 || y.len() != 32 {
+            if x.len() != size || y.len() != size {
                 return None;
             }
             let mut point = vec![4u8];
             point.extend_from_slice(&x);
             point.extend_from_slice(&y);
-            KeyKind::Ec(point)
+            KeyKind::Ec { curve, point }
         }
         (Some("OKP"), Some("Ed25519")) => {
             let x = field("x")?;
@@ -272,7 +319,7 @@ impl Verifier {
             .any(|a| !DEFAULT_ALGORITHMS.contains(&a.as_str()))
         {
             return Err(Error::config(
-                "oidc: algorithms must be a subset of RS256, ES256, EdDSA",
+                "oidc: algorithms must be a subset of RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, EdDSA",
             ));
         }
         let http = match options.http_client {
@@ -397,7 +444,10 @@ impl Verifier {
             )));
         }
         let signed = format!("{head}.{payload}");
-        if !candidates.iter().any(|k| k.verify(signed.as_bytes(), &sig)) {
+        if !candidates
+            .iter()
+            .any(|k| k.verify(alg, signed.as_bytes(), &sig))
+        {
             return Err(auth("signature is invalid"));
         }
         self.check_claims(&claims)?;

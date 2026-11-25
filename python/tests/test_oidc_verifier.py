@@ -1,4 +1,4 @@
-"""Conformance cases OIDC-01…OIDC-17 (docs/oidc-conformance.md) against the local fake IdP."""
+"""Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against the local fake IdP."""
 
 from __future__ import annotations
 
@@ -12,8 +12,12 @@ from typing import Any
 import httpx
 import jwt
 import pytest
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from grow_oidc import (
+    DEFAULT_ALGORITHMS,
     AuthenticationError,
     ConfigError,
     UnavailableError,
@@ -56,12 +60,111 @@ def test_oidc_01_rs256_via_discovery(idp: FakeIdP) -> None:
     assert idp.hits["/.well-known/openid-configuration"] == 1
 
 
-@pytest.mark.parametrize("alg", ["ES256", "EdDSA"])
-def test_oidc_02_03_other_algorithms(idp: FakeIdP, alg: str) -> None:
-    idp.rotate(alg)
+@pytest.mark.parametrize(
+    "alg", ["ES256", "ES384", "ES512", "EdDSA", "RS384", "RS512", "PS256", "PS384", "PS512"]
+)
+async def test_oidc_02_03_other_algorithms(idp: FakeIdP, alg: str) -> None:
+    key = idp.rotate(alg)
+    assert jwt.get_unverified_header(idp.mint())["alg"] == alg == key.public_jwk["alg"]
     user = make(idp).verify(idp.mint({"preferred_username": "bob"}))
     assert user.name == "bob"
     assert user.email is None
+    assert (await make(idp).averify(idp.mint())).sub == "user-1"
+    # Logto-style JWKS: no `alg` on the key, binding by kty/crv only.
+    bare = {k: v for k, v in key.public_jwk.items() if k != "alg"}
+    v = _static_verifier(idp, [bare])
+    assert v.verify(idp.mint()).sub == "user-1"
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _static_verifier(idp: FakeIdP, keys: list[dict[str, Any]]) -> Verifier:
+    http = httpx.Client(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"keys": keys}))
+    )
+    return make(idp, jwks_url="http://x/jwks", http_client=http)
+
+
+def _signing_input(idp: FakeIdP, alg: str, kid: str) -> bytes:
+    now = int(time.time())
+    header = {"alg": alg, "typ": "JWT", "kid": kid}
+    claims = {"iss": idp.issuer, "aud": "app-client", "sub": "u", "exp": now + 300}
+    return f"{_b64(json.dumps(header).encode())}.{_b64(json.dumps(claims).encode())}".encode()
+
+
+def _ec_token(idp: FakeIdP, private_key: ec.EllipticCurvePrivateKey, alg: str, kid: str) -> str:
+    signed = _signing_input(idp, alg, kid)
+    size = (private_key.curve.key_size + 7) // 8
+    hash_alg: hashes.HashAlgorithm = {
+        "ES256": hashes.SHA256(),
+        "ES384": hashes.SHA384(),
+        "ES512": hashes.SHA512(),
+    }[alg]
+    r, s = decode_dss_signature(private_key.sign(signed, ec.ECDSA(hash_alg)))
+    sig = r.to_bytes(size, "big") + s.to_bytes(size, "big")
+    return f"{signed.decode()}.{_b64(sig)}"
+
+
+def test_oidc_19_alg_key_mismatch_rejected(idp: FakeIdP) -> None:
+    def jwk_of(private_key: Any, kid: str) -> dict[str, Any]:
+        algo: Any = (
+            jwt.algorithms.ECAlgorithm
+            if isinstance(private_key, ec.EllipticCurvePrivateKey)
+            else jwt.algorithms.RSAAlgorithm
+        )
+        return {**algo.to_jwk(private_key.public_key(), as_dict=True), "kid": kid}
+
+    # (a) P-256 key without `alg`; the header claims ES384 (signed with that P-256 key).
+    p256 = ec.generate_private_key(ec.SECP256R1())
+    v = _static_verifier(idp, [jwk_of(p256, "k")])
+    assert v.verify(_ec_token(idp, p256, "ES256", "k")).sub == "u"
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(_ec_token(idp, p256, "ES384", "k"))
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(_ec_token(idp, p256, "ES512", "k"))
+    # (b) P-384 key without `alg`; the header claims ES256.
+    p384 = ec.generate_private_key(ec.SECP384R1())
+    v = _static_verifier(idp, [jwk_of(p384, "k")])
+    assert v.verify(_ec_token(idp, p384, "ES384", "k")).sub == "u"
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(_ec_token(idp, p384, "ES256", "k"))
+    # P-521 key: ES512 only.
+    p521 = ec.generate_private_key(ec.SECP521R1())
+    v = _static_verifier(idp, [jwk_of(p521, "k")])
+    assert v.verify(_ec_token(idp, p521, "ES512", "k")).sub == "u"
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(_ec_token(idp, p521, "ES384", "k"))
+    # An EC key never verifies an RSA algorithm and vice versa.
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    v = _static_verifier(idp, [jwk_of(p256, "k")])
+    rs = jwt.encode({"sub": "u"}, rsa_key, algorithm="RS256", headers={"kid": "k"})
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(rs)
+    # (c) RSA key whose JWK says RS256; the header claims PS256.
+    v = _static_verifier(idp, [{**jwk_of(rsa_key, "k"), "alg": "RS256"}])
+    signed = _signing_input(idp, "PS256", "k")
+    pss = rsa_key.sign(
+        signed,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32),
+        hashes.SHA256(),
+    )
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(f"{signed.decode()}.{_b64(pss)}")
+    # (d) RSA key without `alg`: a PKCS#1 v1.5 signature under a PS256 header is invalid.
+    v = _static_verifier(idp, [jwk_of(rsa_key, "k")])
+    assert v.verify(f"{signed.decode()}.{_b64(pss)}").sub == "u"
+    pkcs1 = rsa_key.sign(signed, padding.PKCS1v15(), hashes.SHA256())
+    with pytest.raises(AuthenticationError, match="signature is invalid"):
+        v.verify(f"{signed.decode()}.{_b64(pkcs1)}")
+    # RSA keys below 2048 bit are never used.
+    small = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    v = _static_verifier(idp, [jwk_of(small, "k")])
+    weak_input = _signing_input(idp, "RS256", "k")
+    weak = small.sign(weak_input, padding.PKCS1v15(), hashes.SHA256())
+    with pytest.raises(AuthenticationError, match="no key matches kid k"):
+        v.verify(f"{weak_input.decode()}.{_b64(weak)}")
 
 
 def test_oidc_04_to_08_claims(idp: FakeIdP) -> None:
@@ -95,9 +198,19 @@ def test_oidc_09_algorithms(idp: FakeIdP) -> None:
 
     with pytest.raises(AuthenticationError, match="none is not allowed"):
         v.verify(f"{enc({'alg': 'none'})}.{enc({'sub': 'x'})}.")
-    hs = jwt.encode({"sub": "x"}, "0123456789abcdef0123456789abcdef", algorithm="HS256")
-    with pytest.raises(AuthenticationError, match="HS256 is not allowed"):
-        v.verify(hs)
+    secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    for hs_alg in ("HS256", "HS384", "HS512"):
+        hs = jwt.encode({"sub": "x"}, secret, algorithm=hs_alg)
+        with pytest.raises(AuthenticationError, match=f"{hs_alg} is not allowed"):
+            v.verify(hs)
+    for alg in ("none", "None", "ES256K", "RS1", "PS1"):
+        with pytest.raises(AuthenticationError, match="is not allowed"):
+            v.verify(f"{enc({'alg': alg})}.{enc({'sub': 'x'})}.c2ln")
+    for bad_alg in (["HS256"], ["none"], ["RS256", "HS512"], []):
+        with pytest.raises(ConfigError, match="non-empty subset of RS256, RS384"):
+            make(idp, algorithms=bad_alg)
+    assert make(idp).algorithms == DEFAULT_ALGORITHMS
+    assert len(DEFAULT_ALGORITHMS) == 10
     with pytest.raises(AuthenticationError, match=r"\(none\) is not allowed"):
         v.verify(f"{enc({})}.e30.c2ln")
     idp.rotate("ES256")

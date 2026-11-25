@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 
 import { type CryptoKey, type JWK, SignJWT, exportJWK, generateKeyPair } from "jose";
 
-import type { SigningAlgorithm } from "./verifier.js";
+import { DEFAULT_ALGORITHMS, type SigningAlgorithm } from "./verifier.js";
 
 /** One signing key of the fake IdP. */
 export interface FakeIdpKey {
@@ -65,7 +65,7 @@ export class FakeIdp {
         body = {
           issuer: this.issuer,
           jwks_uri: `${this.issuer}/jwks`,
-          id_token_signing_alg_values_supported: ["RS256", "ES256", "EdDSA"],
+          id_token_signing_alg_values_supported: [...DEFAULT_ALGORITHMS],
         };
       } else if (path === "/jwks") {
         body = { keys: this.keys.map((key) => key.publicJwk) };
@@ -82,7 +82,10 @@ export class FakeIdp {
     return this;
   }
 
-  /** Adds a new key and makes it current (the old keys stay published until removed). */
+  /**
+   * Adds a new key of `alg` (any supported algorithm; EC curves follow the algorithm, RSA keys are
+   * 2048-bit) and makes it current (the old keys stay published until removed).
+   */
   async rotate(alg: SigningAlgorithm = "RS256"): Promise<FakeIdpKey> {
     this.#counter += 1;
     const kid = `key-${this.#counter}`;

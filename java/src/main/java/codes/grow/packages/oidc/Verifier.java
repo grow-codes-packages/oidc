@@ -28,18 +28,24 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * Verifies OIDC access tokens (JWT) against the issuer's JWKS. Thread-safe.
  *
- * <p>Checks the signature (RS256/ES256/EdDSA allow-list), {@code iss} (exact), {@code aud}
- * (contains), {@code exp} (required), {@code nbf} and {@code sub} with a clock skew (default 60 s).
- * Keys come from the JWKS URL or OIDC discovery, are cached (default 10 min) and refetched when a
- * token names an unknown {@code kid} (key rotation, at most once per cooldown).
+ * <p>Checks the signature (RS256/384/512, PS256/384/512, ES256/384/512 and EdDSA allow-list; the
+ * key type and curve must match the algorithm), {@code iss} (exact), {@code aud} (contains), {@code
+ * exp} (required), {@code nbf} and {@code sub} with a clock skew (default 60 s). Keys come from the
+ * JWKS URL or OIDC discovery, are cached (default 10 min) and refetched when a token names an
+ * unknown {@code kid} (key rotation, at most once per cooldown).
  *
  * <p>Throws {@link AuthenticationException} for every invalid token (the message names the failed
  * check, never the token), {@link UnavailableException} when discovery or the JWKS cannot be
  * fetched and {@link ConfigException} for invalid options.
  */
 public final class Verifier {
-  /** Accepted algorithms by default. */
-  public static final List<String> DEFAULT_ALGORITHMS = List.of("RS256", "ES256", "EdDSA");
+  /**
+   * Accepted algorithms by default: every supported asymmetric algorithm ({@code none} and HMAC are
+   * never accepted).
+   */
+  public static final List<String> DEFAULT_ALGORITHMS =
+      List.of(
+          "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA");
 
   /** Default tolerance applied to {@code exp} and {@code nbf}. */
   public static final Duration DEFAULT_CLOCK_SKEW = Duration.ofSeconds(60);
@@ -89,7 +95,8 @@ public final class Verifier {
     this.rolesClaim = claim.isEmpty() ? "roles" : claim;
     if (b.algorithms.isEmpty() || !DEFAULT_ALGORITHMS.containsAll(b.algorithms)) {
       throw new ConfigException(
-          "oidc: algorithms must be a non-empty subset of RS256, ES256, EdDSA");
+          "oidc: algorithms must be a non-empty subset of RS256, RS384, RS512, PS256, PS384, PS512,"
+              + " ES256, ES384, ES512, EdDSA");
     }
     this.algorithms = List.copyOf(b.algorithms);
     this.clockSkew = nonNegative("clockSkew", b.clockSkew);
@@ -503,7 +510,8 @@ public final class Verifier {
     }
 
     /**
-     * Accepted algorithms, a subset of RS256, ES256, EdDSA.
+     * Accepted algorithms, a subset of RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384,
+     * ES512, EdDSA (default all).
      *
      * @param value the algorithms
      * @return this builder

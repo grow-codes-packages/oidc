@@ -57,7 +57,7 @@ func TestOIDC01VerifiesRS256ViaDiscovery(t *testing.T) {
 }
 
 func TestOIDC02And03OtherAlgorithms(t *testing.T) {
-	for _, alg := range []string{"ES256", "EdDSA"} {
+	for _, alg := range []string{"ES256", "EdDSA", "ES384", "ES512", "RS384", "RS512", "PS256", "PS384", "PS512"} {
 		idp := oidctest.New("app-client", alg)
 		user, err := newVerifier(t, idp, nil).Verify(context.Background(), idp.Mint(map[string]any{"preferred_username": "bob"}, oidctest.MintOptions{}))
 		idp.Close()
@@ -112,8 +112,10 @@ func TestOIDC09RejectsAlgorithms(t *testing.T) {
 	enc := func(v any) string { b, _ := json.Marshal(v); return base64.RawURLEncoding.EncodeToString(b) }
 	_, err := v.Verify(ctx, enc(map[string]any{"alg": "none"})+"."+enc(map[string]any{"sub": "x"})+".")
 	wantAuth(t, err, "not allowed")
-	_, err = v.Verify(ctx, enc(map[string]any{"alg": "HS256"})+"."+enc(map[string]any{"sub": "x"})+".c2ln")
-	wantAuth(t, err, "not allowed")
+	for _, alg := range []string{"HS256", "HS384", "HS512", "None", "NONE"} {
+		_, err = v.Verify(ctx, enc(map[string]any{"alg": alg})+"."+enc(map[string]any{"sub": "x"})+".c2ln")
+		wantAuth(t, err, alg+" is not allowed")
+	}
 	_, err = v.Verify(ctx, enc(map[string]any{"alg": strings.Repeat("A", 40)})+".e30.c2ln")
 	wantAuth(t, err, "not allowed")
 	_, err = v.Verify(ctx, enc(map[string]any{})+".e30.c2ln")
@@ -381,4 +383,103 @@ func TestJWKSIgnoresUnusableKeys(t *testing.T) {
 	wantAuth(t, err, "aud")
 	_, err = newVerifier(t, idp, nil).Verify(context.Background(), idp.Mint(map[string]any{"exp": json.RawMessage("1e400")}, oidctest.MintOptions{Kid: "key-1"}))
 	wantAuth(t, err, "exp")
+}
+
+// servedJWKS serves the given keys as a JWKS and returns its URL.
+func servedJWKS(t *testing.T, keys ...map[string]any) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": keys})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// publicJWK fetches the published JWK of kid from idp, without its "alg" when dropAlg is set.
+func publicJWK(t *testing.T, idp *oidctest.IdP, kid string, dropAlg bool) map[string]any {
+	t.Helper()
+	res, err := http.Get(idp.Issuer + "/jwks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	var doc struct{ Keys []map[string]any }
+	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range doc.Keys {
+		if k["kid"] == kid {
+			if dropAlg {
+				delete(k, "alg")
+			}
+			return k
+		}
+	}
+	t.Fatalf("kid %s not published", kid)
+	return nil
+}
+
+// resign replaces the header alg of a token minted by key and signs it again with key's own
+// algorithm, so the header names an algorithm the key was not made for.
+func resign(key *oidctest.Key, token, alg string) string {
+	parts := strings.Split(token, ".")
+	raw, _ := base64.RawURLEncoding.DecodeString(parts[0])
+	header := map[string]any{}
+	_ = json.Unmarshal(raw, &header)
+	header["alg"] = alg
+	h, _ := json.Marshal(header)
+	signed := base64.RawURLEncoding.EncodeToString(h) + "." + parts[1]
+	return signed + "." + base64.RawURLEncoding.EncodeToString(oidctest.Sign(key, []byte(signed)))
+}
+
+func TestOIDC19AlgKeyMismatchRejected(t *testing.T) {
+	ctx := context.Background()
+	verify := func(idp *oidctest.IdP, jwks, token string) error {
+		v, err := oidc.New(oidc.Options{Issuer: idp.Issuer, Audience: "app-client", JWKSURL: jwks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = v.Verify(ctx, token)
+		return err
+	}
+	cases := []struct {
+		name, keyAlg, headerAlg string
+		dropAlg                 bool
+		want                    string
+	}{
+		{"P-256 key, header ES384", "ES256", "ES384", true, "no key matches"},
+		{"P-384 key, header ES256", "ES384", "ES256", true, "no key matches"},
+		{"P-521 key, header ES384", "ES512", "ES384", true, "no key matches"},
+		{"P-384 key, header RS384", "ES384", "RS384", true, "no key matches"},
+		{"RSA key with alg RS256, header PS256", "RS256", "PS256", false, "no key matches"},
+		{"RSA key without alg, PKCS1 signature, header PS256", "RS256", "PS256", true, "signature is invalid"},
+		{"RSA key without alg, header ES256", "RS256", "ES256", true, "no key matches"},
+		{"Ed25519 key, header ES256", "EdDSA", "ES256", true, "no key matches"},
+		{"P-256 key with alg ES256, header ES384", "ES256", "ES384", false, "no key matches"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			idp := oidctest.New("app-client", c.keyAlg)
+			defer idp.Close()
+			key := idp.Rotate(c.keyAlg)
+			jwks := servedJWKS(t, publicJWK(t, idp, key.Kid, c.dropAlg))
+			good := idp.Mint(nil, oidctest.MintOptions{})
+			if err := verify(idp, jwks, good); err != nil {
+				t.Fatalf("matching alg rejected: %v", err)
+			}
+			wantAuth(t, verify(idp, jwks, resign(key, good, c.headerAlg)), c.want)
+		})
+	}
+	// A matching key type but the wrong hash: a PS256 key signature presented as PS384.
+	idp := oidctest.New("app-client", "PS256")
+	defer idp.Close()
+	key := idp.Rotate("PS256")
+	jwks := servedJWKS(t, publicJWK(t, idp, key.Kid, true))
+	wantAuth(t, verify(idp, jwks, resign(key, idp.Mint(nil, oidctest.MintOptions{}), "PS384")), "signature is invalid")
+	// ES signatures of the wrong length never verify.
+	es := oidctest.New("app-client", "ES384")
+	defer es.Close()
+	parts := strings.Split(es.Mint(nil, oidctest.MintOptions{}), ".")
+	_, err := newVerifier(t, es, nil).Verify(ctx, parts[0]+"."+parts[1]+"."+base64.RawURLEncoding.EncodeToString(make([]byte, 64)))
+	wantAuth(t, err, "signature is invalid")
 }

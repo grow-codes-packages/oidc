@@ -39,6 +39,11 @@ instead and returns the names it set.
 
 ## Token verification differences
 
+- Signature algorithms: RS256/384/512, PS256/384/512, ES256/384/512 and EdDSA (Ed25519) in
+  TypeScript, Go, Python and Java. **Rust does not accept ES512** (P-521): its crypto library `ring`
+  has no P-521 support, so ES512 is outside the Rust allow-list (a `CONFIG` error when configured,
+  `AUTHENTICATION` "not allowed" for a token) and P-521 JWKS keys are skipped. Logto (ES384 by
+  default), Casdoor (RS256), Keycloak, Auth0, Entra ID and Zitadel defaults work in every language.
 - Rust ships no public fake IdP (ring cannot generate RSA keys); its tests use wiremock + a test-only
   RSA fixture. The other languages export one (`FakeIdp`, `oidctest`, `FakeIdP`, `oidctest.FakeIdp`).
 - Python's `averify` does not deduplicate concurrent JWKS fetches (the sync `verify` does).

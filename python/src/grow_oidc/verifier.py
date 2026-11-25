@@ -1,6 +1,7 @@
 """Provider-neutral OIDC access-token verification (service-owned).
 
-JWKS discovery, caching and rotation; RS256/ES256/EdDSA; ``iss``/``aud``/``exp``/``nbf`` checks
+JWKS discovery, caching and rotation; RS256/384/512, PS256/384/512, ES256/384/512 and EdDSA,
+each bound to a matching key type and curve; ``iss``/``aud``/``exp``/``nbf`` checks
 with a clock skew (default 60 s); roles from a configurable claim.
 """
 
@@ -35,7 +36,18 @@ __all__ = [
 ]
 
 #: Accepted algorithms (asymmetric only; ``none`` and HMAC are never accepted).
-DEFAULT_ALGORITHMS: tuple[str, ...] = ("RS256", "ES256", "EdDSA")
+DEFAULT_ALGORITHMS: tuple[str, ...] = (
+    "RS256",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "EdDSA",
+)
 #: Tolerance applied to ``exp`` and ``nbf``.
 DEFAULT_CLOCK_SKEW_S = 60.0
 #: JWKS cache lifetime.
@@ -45,7 +57,21 @@ DEFAULT_JWKS_REFRESH_COOLDOWN_S = 30.0
 #: Timeout of discovery and JWKS requests.
 DEFAULT_HTTP_TIMEOUT_S = 10.0
 
-_KTY_FOR_ALG = {"RS256": "RSA", "ES256": "EC", "EdDSA": "OKP"}
+#: Key type and curve a JWK must have to verify each algorithm (``None``: no curve check).
+_KEY_FOR_ALG: dict[str, tuple[str, str | None]] = {
+    "RS256": ("RSA", None),
+    "RS384": ("RSA", None),
+    "RS512": ("RSA", None),
+    "PS256": ("RSA", None),
+    "PS384": ("RSA", None),
+    "PS512": ("RSA", None),
+    "ES256": ("EC", "P-256"),
+    "ES384": ("EC", "P-384"),
+    "ES512": ("EC", "P-521"),
+    "EdDSA": ("OKP", "Ed25519"),
+}
+#: Smallest accepted RSA modulus in bits.
+_MIN_RSA_BITS = 2048
 _BEARER_RE = re.compile(r"^\s*bearer\s+(\S+)\s*$", re.IGNORECASE)
 
 
@@ -82,15 +108,30 @@ def bearer_token(source: Any) -> str | None:
     return match.group(1) if match else None
 
 
+def _text(raw: Mapping[str, Any], name: str) -> str | None:
+    value = raw.get(name)
+    return value if isinstance(value, str) else None
+
+
 def _check_url(name: str, value: str) -> None:
     parsed = urlparse(value)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ConfigError(f"oidc: {name} must be an http or https URL")
 
 
+@dataclass(frozen=True)
+class _Key:
+    kid: str | None
+    alg: str | None
+    use: str | None
+    kty: str | None
+    crv: str | None
+    jwk: jwt.PyJWK
+
+
 @dataclass
 class _KeySet:
-    keys: list[tuple[str | None, str | None, str | None, jwt.PyJWK]]
+    keys: list[_Key]
     fetched_at: float
 
 
@@ -132,7 +173,9 @@ class Verifier:
         self.roles_claim = (roles_claim or "roles").strip() or "roles"
         algs = tuple(algorithms)
         if not algs or any(alg not in DEFAULT_ALGORITHMS for alg in algs):
-            raise ConfigError("oidc: algorithms must be a non-empty subset of RS256, ES256, EdDSA")
+            raise ConfigError(
+                "oidc: algorithms must be a non-empty subset of " + ", ".join(DEFAULT_ALGORITHMS)
+            )
         self.algorithms = algs
         for name, value in (
             ("clock_skew_s", clock_skew_s),
@@ -214,15 +257,16 @@ class Verifier:
 
     @staticmethod
     def _candidates(keys: _KeySet, alg: str, kid: str | None) -> list[jwt.PyJWK]:
+        kty, crv = _KEY_FOR_ALG[alg]
         out = []
-        for key_kid, key_alg, use, key in keys.keys:
-            if kid is not None and key_kid != kid:
+        for key in keys.keys:
+            if kid is not None and key.kid != kid:
                 continue
-            if use == "enc" or (key_alg is not None and key_alg != alg):
+            if key.use == "enc" or (key.alg is not None and key.alg != alg):
                 continue
-            if key.key_type != _KTY_FOR_ALG[alg]:
+            if key.kty != kty or (crv is not None and key.crv != crv):
                 continue
-            out.append(key)
+            out.append(key.jwk)
         return out
 
     def _finish(self, token: str, alg: str, kid: str | None, keys: list[jwt.PyJWK]) -> AuthUser:
@@ -341,7 +385,18 @@ class Verifier:
                 key = jwt.PyJWK(raw)
             except (jwt.PyJWTError, ValueError, TypeError, KeyError):
                 continue
-            parsed.append((raw.get("kid"), raw.get("alg"), raw.get("use"), key))
+            if key.key_type == "RSA" and getattr(key.key, "key_size", 0) < _MIN_RSA_BITS:
+                continue
+            parsed.append(
+                _Key(
+                    kid=_text(raw, "kid"),
+                    alg=_text(raw, "alg"),
+                    use=_text(raw, "use"),
+                    kty=_text(raw, "kty"),
+                    crv=_text(raw, "crv"),
+                    jwk=key,
+                )
+            )
         keys = _KeySet(parsed, self._now())
         with self._lock:
             self._keys = keys
