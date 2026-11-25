@@ -483,3 +483,70 @@ func TestOIDC19AlgKeyMismatchRejected(t *testing.T) {
 	_, err := newVerifier(t, es, nil).Verify(ctx, parts[0]+"."+parts[1]+"."+base64.RawURLEncoding.EncodeToString(make([]byte, 64)))
 	wantAuth(t, err, "signature is invalid")
 }
+
+// OIDC-20: the issuer comparison ignores trailing slashes only (Authentik's iss ends with "/").
+func TestOIDC20IssuerTrailingSlashes(t *testing.T) {
+	idp := oidctest.New("app-client", "RS256")
+	defer idp.Close()
+	ctx := context.Background()
+
+	// Token iss with a trailing slash, configured issuer without.
+	if _, err := newVerifier(t, idp, nil).Verify(ctx, idp.Mint(map[string]any{"iss": idp.Issuer + "/"}, oidctest.MintOptions{})); err != nil {
+		t.Fatalf("iss with slash: %v", err)
+	}
+	if _, err := newVerifier(t, idp, nil).Verify(ctx, idp.Mint(map[string]any{"iss": idp.Issuer + "//"}, oidctest.MintOptions{})); err != nil {
+		t.Fatalf("iss with two slashes: %v", err)
+	}
+
+	// Configured issuer with a trailing slash (discovery mode), token iss without.
+	before := idp.Hits("/.well-known/openid-configuration")
+	slashed := newVerifier(t, idp, func(o *oidc.Options) { o.Issuer = idp.Issuer + "/" })
+	if _, err := slashed.Verify(ctx, idp.Mint(nil, oidctest.MintOptions{})); err != nil {
+		t.Fatalf("configured issuer with slash: %v", err)
+	}
+	if got := idp.Hits("/.well-known/openid-configuration") - before; got != 1 {
+		t.Fatalf("discovery hits = %d, want 1 (no double slash)", got)
+	}
+	if idp.Hits("//.well-known/openid-configuration") != 0 {
+		t.Fatal("discovery URL has a double slash")
+	}
+
+	// Discovery document issuer with and without a trailing slash: both work.
+	for _, suffix := range []string{"/", ""} {
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/.well-known/openid-configuration" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"issuer": srv.URL + suffix, "jwks_uri": idp.Issuer + "/jwks"})
+		}))
+		v := newVerifier(t, idp, func(o *oidc.Options) { o.Issuer = srv.URL })
+		if _, err := v.Verify(ctx, idp.Mint(map[string]any{"iss": srv.URL + "/"}, oidctest.MintOptions{})); err != nil {
+			srv.Close()
+			t.Fatalf("discovery issuer %q: %v", srv.URL+suffix, err)
+		}
+		srv.Close()
+	}
+
+	// Anything but trailing slashes still has to match exactly.
+	port := idp.Issuer[strings.LastIndex(idp.Issuer, ":"):]
+	for name, iss := range map[string]any{
+		"path":       idp.Issuer + "/other",
+		"path slash": idp.Issuer + "/other/",
+		"host":       strings.Replace(idp.Issuer, "127.0.0.1", "localhost", 1),
+		"port":       strings.Replace(idp.Issuer, port, ":1", 1),
+		"scheme":     strings.Replace(idp.Issuer, "http://", "https://", 1),
+		"case":       strings.ToUpper(idp.Issuer),
+		"non-string": 42,
+	} {
+		_, err := newVerifier(t, idp, nil).Verify(ctx, idp.Mint(map[string]any{"iss": iss}, oidctest.MintOptions{}))
+		if err == nil {
+			t.Fatalf("%s: iss %v accepted", name, iss)
+		}
+		wantAuth(t, err, "iss")
+	}
+	_, err := newVerifier(t, idp, nil).Verify(ctx, idp.Mint(map[string]any{"iss": nil}, oidctest.MintOptions{}))
+	wantAuth(t, err, "iss")
+}

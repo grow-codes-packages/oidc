@@ -29,7 +29,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-/** Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against the local fake IdP. */
+/** Conformance cases OIDC-01…OIDC-20 (docs/oidc-conformance.md) against the local fake IdP. */
 class VerifierTest {
   private FakeIdp idp;
 
@@ -333,6 +333,91 @@ class VerifierTest {
         });
     server.start();
     return server;
+  }
+
+  @Test
+  void oidc20TokenIssWithTrailingSlashIsAccepted() {
+    // Authentik: the token iss ends with "/", the configured issuer does not.
+    String token = idp.mint(Map.of("iss", idp.issuer() + "/"));
+    assertThat(verifier().verify(token).sub()).isEqualTo("user-1");
+    assertThat(verifier().verify(idp.mint(Map.of("iss", idp.issuer() + "//"))).sub())
+        .isEqualTo("user-1");
+  }
+
+  @Test
+  void oidc20ConfiguredIssuerWithTrailingSlashIsAccepted() {
+    Verifier v = Verifier.builder().issuer(idp.issuer() + "/").audience("app-client").build();
+    assertThat(v.verify(idp.mint(Map.of())).sub()).isEqualTo("user-1");
+    assertThat(v.verify(idp.mint(Map.of("iss", idp.issuer() + "/"))).sub()).isEqualTo("user-1");
+    assertThat(idp.hits("/.well-known/openid-configuration")).isEqualTo(1);
+    assertThat(idp.hits("//.well-known/openid-configuration")).isZero();
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"", "/"})
+  void oidc20DiscoveryIssuerWithOrWithoutTrailingSlashIsAccepted(String suffix) throws IOException {
+    AtomicReference<String> base = new AtomicReference<>();
+    HttpServer s = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+    List<String> paths = new ArrayList<>();
+    s.createContext(
+        "/",
+        ex -> {
+          paths.add(ex.getRequestURI().getPath());
+          byte[] bytes =
+              codes.grow.packages.oidc.core.Json.encode(
+                  Map.of("issuer", base.get() + suffix, "jwks_uri", idp.issuer() + "/jwks"));
+          ex.sendResponseHeaders(200, bytes.length);
+          ex.getResponseBody().write(bytes);
+          ex.close();
+        });
+    s.start();
+    try {
+      base.set("http://127.0.0.1:" + s.getAddress().getPort());
+      for (String configured : List.of(base.get(), base.get() + "/")) {
+        Verifier v = Verifier.builder().issuer(configured).audience("app-client").build();
+        assertThat(v.verify(idp.mint(Map.of("iss", base.get()))).sub()).isEqualTo("user-1");
+        assertThat(v.verify(idp.mint(Map.of("iss", base.get() + "/"))).sub()).isEqualTo("user-1");
+      }
+      assertThat(paths).containsOnly("/.well-known/openid-configuration").hasSize(2);
+    } finally {
+      s.stop(0);
+    }
+  }
+
+  @Test
+  void oidc20OtherIssuerDifferencesAreRejected() {
+    String issuer = idp.issuer();
+    int port = Integer.parseInt(issuer.substring(issuer.lastIndexOf(':') + 1));
+    List<String> others =
+        List.of(
+            issuer + "/other",
+            issuer + "/other/",
+            issuer.replace("127.0.0.1", "localhost"),
+            "http://127.0.0.1:" + (port + 1),
+            issuer.replace("http://", "https://"),
+            issuer.replace("http://", "HTTP://"),
+            issuer + "/ ");
+    for (String other : others) {
+      assertAuth(() -> verifier().verify(idp.mint(Map.of("iss", other))), "iss");
+    }
+    assertAuth(() -> verifier().verify(idp.mint(claims("iss", null))), "iss");
+    assertAuth(() -> verifier().verify(idp.mint(Map.of("iss", 42))), "iss");
+    Verifier withPath =
+        Verifier.builder()
+            .issuer(issuer + "/app/")
+            .jwksUrl(issuer + "/jwks")
+            .audience("app-client")
+            .build();
+    assertAuth(() -> withPath.verify(idp.mint(Map.of())), "iss");
+  }
+
+  @Test
+  void oidc20StripTrailingSlashes() {
+    assertThat(Verifier.stripTrailingSlashes("")).isEmpty();
+    assertThat(Verifier.stripTrailingSlashes("/")).isEmpty();
+    assertThat(Verifier.stripTrailingSlashes("a//")).isEqualTo("a");
+    assertThat(Verifier.stripTrailingSlashes("a")).isEqualTo("a");
+    assertThat(Verifier.stripTrailingSlashes("http://x/a/b/")).isEqualTo("http://x/a/b");
   }
 
   @Test

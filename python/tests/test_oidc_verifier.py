@@ -1,4 +1,4 @@
-"""Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against the local fake IdP."""
+"""Conformance cases OIDC-01…OIDC-20 (docs/oidc-conformance.md) against the local fake IdP."""
 
 from __future__ import annotations
 
@@ -403,3 +403,105 @@ async def test_async_verify(idp: FakeIdP) -> None:
             await make(idp, async_http_client=client).averify(idp.mint())
     with pytest.raises(UnavailableError, match="request failed"):
         await make(idp, jwks_url="http://127.0.0.1:1/jwks").averify(idp.mint())
+
+
+async def test_oidc_20_iss_with_trailing_slash_accepted(idp: FakeIdP) -> None:
+    # Authentik: token iss ends with "/", configured issuer has none.
+    token = idp.mint({"iss": idp.issuer + "/"})
+    assert make(idp).verify(token).sub == "user-1"
+    assert (await make(idp).averify(token)).sub == "user-1"
+    # Several trailing slashes on the token side are ignored too.
+    assert make(idp).verify(idp.mint({"iss": idp.issuer + "//"})).sub == "user-1"
+
+
+async def test_oidc_20_configured_issuer_with_trailing_slash_accepted(idp: FakeIdP) -> None:
+    v = Verifier(idp.issuer + "/", "app-client")
+    assert v.verify(idp.mint()).sub == "user-1"
+    assert (await Verifier(idp.issuer + "/", "app-client").averify(idp.mint())).sub == "user-1"
+    assert v.verify(idp.mint({"iss": idp.issuer + "/"})).sub == "user-1"
+    # Discovery URL has no double slash.
+    assert idp.hits["/.well-known/openid-configuration"] == 2
+    assert not any(path.startswith("//") for path in idp.hits)
+
+
+@pytest.mark.parametrize("discovery_slash", ["", "/"])
+@pytest.mark.parametrize("configured_slash", ["", "/"])
+async def test_oidc_20_discovery_issuer_with_or_without_slash(
+    idp: FakeIdP, discovery_slash: str, configured_slash: str
+) -> None:
+    base = "http://idp.test"
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/.well-known/openid-configuration":
+            return httpx.Response(
+                200, json={"issuer": base + discovery_slash, "jwks_uri": f"{base}/jwks"}
+            )
+        if request.url.path == "/jwks":
+            return httpx.Response(200, json={"keys": [k.public_jwk for k in idp.keys]})
+        return httpx.Response(404)
+
+    token = idp.mint({"iss": base + discovery_slash})
+    sync = Verifier(
+        base + configured_slash,
+        "app-client",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert sync.verify(token).sub == "user-1"
+    asynchronous = Verifier(
+        base + configured_slash,
+        "app-client",
+        async_http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    assert (await asynchronous.averify(token)).sub == "user-1"
+    assert seen == ["/.well-known/openid-configuration", "/jwks"] * 2
+
+
+@pytest.mark.parametrize(
+    "iss",
+    [
+        "{issuer}/other",
+        "{issuer}/other/",
+        "{scheme_https}",
+        "{localhost}",
+        "{other_port}",
+        "{issuer}x",
+        "",
+        "/",
+    ],
+)
+async def test_oidc_20_other_issuer_still_rejected(idp: FakeIdP, iss: str) -> None:
+    port = int(idp.issuer.rsplit(":", 1)[1])
+    value = iss.format(
+        issuer=idp.issuer,
+        scheme_https=idp.issuer.replace("http://", "https://"),
+        localhost=idp.issuer.replace("127.0.0.1", "localhost"),
+        other_port=f"http://127.0.0.1:{port + 1}",
+    )
+    for configured in (idp.issuer, idp.issuer + "/"):
+        token = idp.mint({"iss": value})
+        with pytest.raises(AuthenticationError, match="iss"):
+            Verifier(configured, "app-client").verify(token)
+        with pytest.raises(AuthenticationError, match="iss"):
+            await Verifier(configured, "app-client").averify(token)
+
+
+@pytest.mark.parametrize("iss", [None, 42, ["{issuer}"], {"url": "{issuer}"}])
+def test_oidc_20_missing_or_non_string_iss_rejected(idp: FakeIdP, iss: Any) -> None:
+    value = json.loads(json.dumps(iss).replace("{issuer}", idp.issuer))
+    if value is None:
+        token = idp.mint({"iss": None})
+    else:
+        # PyJWT's encode refuses a non-string iss, so sign the raw payload with JWS.
+        key = idp.keys[-1]
+        now = int(time.time())
+        payload = {"iss": value, "aud": "app-client", "sub": "user-1", "exp": now + 300}
+        token = jwt.api_jws.encode(
+            json.dumps(payload).encode(),
+            key.private_key,
+            algorithm=key.alg,
+            headers={"kid": key.kid},
+        )
+    with pytest.raises(AuthenticationError, match="iss"):
+        make(idp).verify(token)

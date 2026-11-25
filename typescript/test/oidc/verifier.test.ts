@@ -1,4 +1,4 @@
-// Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against a local fake IdP.
+// Conformance cases OIDC-01…OIDC-20 (docs/oidc-conformance.md) against a local fake IdP.
 import { constants, generateKeyPairSync, sign as nodeSign, type KeyObject } from "node:crypto";
 
 import { SignJWT, generateKeyPair } from "jose";
@@ -229,6 +229,74 @@ describe("Verifier conformance", () => {
     await expectAuthError(v.verify(mint("EdDSA", "p256", ed.privateKey, "ed")), /no key/);
     // Right key type, wrong signature scheme: PKCS#1 v1.5 signature under a PS256 header.
     await expectAuthError(v.verify(mint("PS256", "rsa", rsa.privateKey, "sha256")), /signature/);
+  });
+
+  it("OIDC-20 ignores trailing slashes on iss and the issuer only", async () => {
+    // Token iss with a trailing slash (Authentik), configured issuer without.
+    for (const iss of [`${idp.issuer}/`, `${idp.issuer}//`]) {
+      await expect(verifier().verify(await idp.mint({ claims: { iss } }))).resolves.toBeTruthy();
+    }
+    // Configured issuer with a trailing slash, token iss without: discovery URL has no "//".
+    const before = idp.hits["/.well-known/openid-configuration"] ?? 0;
+    const slashed = verifier({ issuer: `${idp.issuer}/` });
+    await expect(slashed.verify(await idp.mint())).resolves.toBeTruthy();
+    await expect(
+      slashed.verify(await idp.mint({ claims: { iss: `${idp.issuer}/` } })),
+    ).resolves.toBeTruthy();
+    expect(idp.hits["/.well-known/openid-configuration"]).toBe(before + 1);
+    expect(idp.hits["//.well-known/openid-configuration"]).toBeUndefined();
+    // Anything else still differs.
+    const url = new URL(idp.issuer);
+    const others = [
+      `${idp.issuer}/other`,
+      `${idp.issuer}/other/`,
+      `https://${url.host}`,
+      `http://localhost:${url.port}/`,
+      `http://${url.hostname}:${Number(url.port) + 1}`,
+      idp.issuer.toUpperCase(),
+      `${idp.issuer} `,
+      "/",
+      "",
+    ];
+    for (const iss of others) {
+      await expectAuthError(verifier().verify(await idp.mint({ claims: { iss } })), /claim iss/);
+      await expectAuthError(slashed.verify(await idp.mint({ claims: { iss } })), /claim iss/);
+    }
+    await expectAuthError(
+      verifier().verify(await idp.mint({ claims: { iss: undefined } })),
+      /claim iss is invalid \(missing\)/,
+    );
+    await expectAuthError(
+      verifier().verify(await idp.mint({ claims: { iss: 42 } })),
+      /claim iss is invalid \(missing\)/,
+    );
+  });
+
+  it("OIDC-20 accepts a discovery issuer with or without a trailing slash", async () => {
+    const token = await idp.mint();
+    for (const docIssuer of [idp.issuer, `${idp.issuer}/`]) {
+      for (const configured of [idp.issuer, `${idp.issuer}/`]) {
+        const urls: string[] = [];
+        const v = verifier({
+          issuer: configured,
+          fetch: (input) => {
+            const target = input instanceof Request ? input.url : String(input);
+            urls.push(target);
+            if (target.endsWith("/.well-known/openid-configuration")) {
+              return Promise.resolve(
+                Response.json({ issuer: docIssuer, jwks_uri: `${idp.issuer}/jwks` }),
+              );
+            }
+            return globalThis.fetch(input);
+          },
+        });
+        await expect(v.verify(token)).resolves.toBeTruthy();
+        expect(urls).toEqual([
+          `${idp.issuer}/.well-known/openid-configuration`,
+          `${idp.issuer}/jwks`,
+        ]);
+      }
+    }
   });
 
   it("OIDC-11 refetches the JWKS once when a new kid appears (rotation)", async () => {

@@ -29,10 +29,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * Verifies OIDC access tokens (JWT) against the issuer's JWKS. Thread-safe.
  *
  * <p>Checks the signature (RS256/384/512, PS256/384/512, ES256/384/512 and EdDSA allow-list; the
- * key type and curve must match the algorithm), {@code iss} (exact), {@code aud} (contains), {@code
- * exp} (required), {@code nbf} and {@code sub} with a clock skew (default 60 s). Keys come from the
- * JWKS URL or OIDC discovery, are cached (default 10 min) and refetched when a token names an
- * unknown {@code kid} (key rotation, at most once per cooldown).
+ * key type and curve must match the algorithm), {@code iss} (exact, trailing slashes ignored),
+ * {@code aud} (contains), {@code exp} (required), {@code nbf} and {@code sub} with a clock skew
+ * (default 60 s). Keys come from the JWKS URL or OIDC discovery, are cached (default 10 min) and
+ * refetched when a token names an unknown {@code kid} (key rotation, at most once per cooldown).
  *
  * <p>Throws {@link AuthenticationException} for every invalid token (the message names the failed
  * check, never the token), {@link UnavailableException} when discovery or the JWKS cannot be
@@ -328,8 +328,19 @@ public final class Verifier {
     return n.doubleValue();
   }
 
+  /** {@code value} without trailing slashes (a loop, no regex backtracking). */
+  static String stripTrailingSlashes(String value) {
+    int end = value.length();
+    while (end > 0 && value.charAt(end - 1) == '/') {
+      end--;
+    }
+    return value.substring(0, end);
+  }
+
   private void checkClaims(Map<String, Object> claims) {
-    if (!issuer.equals(claims.get("iss"))) {
+    // Exact match except trailing slashes (Authentik's iss always ends with "/").
+    if (!(claims.get("iss") instanceof String iss)
+        || !stripTrailingSlashes(iss).equals(stripTrailingSlashes(issuer))) {
       throw auth("claim iss is invalid (unexpected value)");
     }
     Object aud = claims.get("aud");
@@ -394,7 +405,7 @@ public final class Verifier {
       if (url == null) {
         JsonNode doc =
             getJson(
-                "discovery", issuer.replaceAll("/+$", "") + "/.well-known/openid-configuration");
+                "discovery", stripTrailingSlashes(issuer) + "/.well-known/openid-configuration");
         JsonNode uri = doc.path("jwks_uri");
         if (!uri.isTextual() || uri.asText().isEmpty()) {
           throw new UnavailableException("discovery: document has no jwks_uri");
@@ -466,7 +477,8 @@ public final class Verifier {
     private Builder() {}
 
     /**
-     * Expected {@code iss}; discovery uses {@code <issuer>/.well-known/openid-configuration}.
+     * Expected {@code iss} (exact, except that trailing slashes on either side are ignored);
+     * discovery uses {@code <issuer without trailing slashes>/.well-known/openid-configuration}.
      *
      * @param value the issuer URL
      * @return this builder

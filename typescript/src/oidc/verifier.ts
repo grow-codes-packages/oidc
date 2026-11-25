@@ -70,7 +70,10 @@ export interface AuthUser {
 
 /** Options of a {@link Verifier}. */
 export interface VerifierOptions {
-  /** Expected `iss` (exact match). Discovery uses `<issuer>/.well-known/openid-configuration`. */
+  /**
+   * Expected `iss` (exact match, except that trailing slashes on either side are ignored).
+   * Discovery uses `<issuer without trailing slashes>/.well-known/openid-configuration`.
+   */
   issuer: string;
   /** Expected `aud` (the token's `aud` must contain it). */
   audience: string;
@@ -132,7 +135,7 @@ interface KeySetEntry {
  * Verifies OIDC access tokens (JWT) against the issuer's JWKS.
  *
  * Checks the signature (RS256/384/512, PS256/384/512, ES256/384/512, EdDSA allow-list; the key's
- * `kty`, EC `crv` and `alg` must match the token's algorithm), `iss` (exact), `aud` (contains),
+ * `kty`, EC `crv` and `alg` must match the token's algorithm), `iss` (exact, trailing slashes ignored), `aud` (contains),
  * `exp` (required) and `nbf` with a clock skew (default 60 s). Keys come from
  * `jwksUrl` or OIDC discovery, are cached (default 10 min) and refetched when a token names an
  * unknown `kid` (key rotation, at most once per cooldown).
@@ -272,13 +275,19 @@ export class Verifier {
 
   async #verifyWith(token: string, entry: KeySetEntry): Promise<AuthUser> {
     const { payload } = await jwtVerify(token, entry.getKey, {
-      issuer: this.issuer,
       audience: this.audience,
       algorithms: [...this.algorithms],
       clockTolerance: Math.floor(this.clockSkewMs / 1000),
       requiredClaims: ["exp", "sub"],
       currentDate: new Date(this.#now()),
     });
+    // Exact match except trailing slashes (Authentik's `iss` always ends with "/").
+    if (typeof payload.iss !== "string") {
+      throw new AuthenticationError("verify: claim iss is invalid (missing)");
+    }
+    if (trimTrailingSlashes(payload.iss) !== trimTrailingSlashes(this.issuer)) {
+      throw new AuthenticationError("verify: claim iss is invalid (unexpected value)");
+    }
     return this.#toUser(payload);
   }
 
