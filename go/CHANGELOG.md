@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/grow-codes-packages/oidc/compare/go/v0.1.1...go/v0.1.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* ignore trailing slashes when comparing the token iss with the issuer (Authentik) ([#10](https://github.com/grow-codes-packages/oidc/issues/10)) ([7d759db](https://github.com/grow-codes-packages/oidc/commit/7d759dbd7523092eb02ef49b225211e6912503a2))
+
 ## [0.1.1](https://github.com/grow-codes-packages/oidc/compare/go/v0.1.0...go/v0.1.1) (2026-11-25)
 
 

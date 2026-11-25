@@ -1,6 +1,6 @@
 {
   "name": "@grow-codes/oidc",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Grow Codes OIDC access-token verification (JWKS, roles, Express/NestJS adapters)",
   "keywords": [
     "oidc",
