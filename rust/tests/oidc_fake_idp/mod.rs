@@ -101,21 +101,19 @@ impl FakeIdp {
         st.counter += 1;
         let kid = format!("key-{}", st.counter);
         let (signer, mut jwk, alg) = match alg {
-            "ES256" => {
-                let pk8 =
-                    EcdsaKeyPair::generate_pkcs8(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-                        .unwrap();
-                let kp = EcdsaKeyPair::from_pkcs8(
-                    &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-                    pk8.as_ref(),
-                    &rng,
-                )
-                .unwrap();
+            "ES256" | "ES384" => {
+                let (signing, curve, size) = if alg == "ES256" {
+                    (&signature::ECDSA_P256_SHA256_FIXED_SIGNING, "P-256", 32)
+                } else {
+                    (&signature::ECDSA_P384_SHA384_FIXED_SIGNING, "P-384", 48)
+                };
+                let pk8 = EcdsaKeyPair::generate_pkcs8(signing, &rng).unwrap();
+                let kp = EcdsaKeyPair::from_pkcs8(signing, pk8.as_ref(), &rng).unwrap();
                 let p = kp.public_key().as_ref().to_vec();
                 (
                     Signer::Ec(kp),
-                    json!({"kty": "EC", "crv": "P-256", "x": b64(&p[1..33]), "y": b64(&p[33..])}),
-                    "ES256",
+                    json!({"kty": "EC", "crv": curve, "x": b64(&p[1..=size]), "y": b64(&p[size + 1..])}),
+                    alg,
                 )
             }
             "EdDSA" => {
@@ -135,7 +133,10 @@ impl FakeIdp {
                 (
                     Signer::Rsa(kp),
                     json!({"kty": "RSA", "n": b64(&n), "e": b64(&e)}),
-                    "RS256",
+                    match alg {
+                        "RS384" | "RS512" | "PS256" | "PS384" | "PS512" => alg,
+                        _ => "RS256",
+                    },
                 )
             }
         };
@@ -150,6 +151,15 @@ impl FakeIdp {
         }));
         st.current = kid.clone();
         kid
+    }
+
+    /// Removes `field` (for example `alg`) from the published JWK of `kid`.
+    pub fn strip_jwk_field(&self, kid: &str, field: &str) {
+        let mut st = self.state.lock().unwrap();
+        for key in st.keys.iter_mut().filter(|k| k.kid == kid) {
+            let key = Arc::get_mut(key).expect("key in use");
+            key.jwk.as_object_mut().unwrap().remove(field);
+        }
     }
 
     pub fn jwks(&self) -> Vec<Value> {
@@ -234,8 +244,15 @@ pub fn sign(key: &Key, data: &[u8]) -> Vec<u8> {
     match &key.signer {
         Signer::Rsa(kp) => {
             let mut sig = vec![0u8; kp.public().modulus_len()];
-            kp.sign(&signature::RSA_PKCS1_SHA256, &rng, data, &mut sig)
-                .unwrap();
+            let padding: &dyn signature::RsaEncoding = match key.alg.as_str() {
+                "RS384" => &signature::RSA_PKCS1_SHA384,
+                "RS512" => &signature::RSA_PKCS1_SHA512,
+                "PS256" => &signature::RSA_PSS_SHA256,
+                "PS384" => &signature::RSA_PSS_SHA384,
+                "PS512" => &signature::RSA_PSS_SHA512,
+                _ => &signature::RSA_PKCS1_SHA256,
+            };
+            kp.sign(padding, &rng, data, &mut sig).unwrap();
             sig
         }
         Signer::Ec(kp) => kp.sign(&rng, data).unwrap().as_ref().to_vec(),

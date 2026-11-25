@@ -7,8 +7,10 @@ This file ships inside every package (npm, Go module, wheel, jar `META-INF/grow/
 ## What it checks
 
 - Signature with keys from `GROW_AUTH_JWKS_URL`, else OIDC discovery
-  (`<issuer>/.well-known/openid-configuration` → `jwks_uri`). Algorithms: **RS256, ES256, EdDSA**
-  only (`none`/HMAC always rejected; RSA keys ≥ 2048 bit).
+  (`<issuer>/.well-known/openid-configuration` → `jwks_uri`). Algorithms: **RS256/384/512,
+  PS256/384/512, ES256/384/512, EdDSA** (Rust: no ES512), each bound to a matching JWKS key: RS*/PS*
+  need RSA ≥ 2048 bit, ES256/ES384/ES512 need EC P-256/P-384/P-521, EdDSA needs Ed25519, and a
+  key's `alg` (when set) must equal the token's. `none`/HMAC are always rejected.
 - `iss` == issuer (exact), `aud` == or contains audience, `exp` required, `nbf`, `sub` required;
   clock skew **60 s**.
 - JWKS cache 10 min; a token with an unknown `kid` triggers one refetch (key rotation), at most once

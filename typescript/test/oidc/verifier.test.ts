@@ -1,4 +1,6 @@
-// Conformance cases OIDC-01…OIDC-17 (docs/oidc-conformance.md) against a local fake IdP.
+// Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against a local fake IdP.
+import { constants, generateKeyPairSync, sign as nodeSign, type KeyObject } from "node:crypto";
+
 import { SignJWT, generateKeyPair } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -55,11 +57,31 @@ describe("Verifier conformance", () => {
     expect(idp.hits["/.well-known/openid-configuration"]).toBe(1);
   });
 
-  it.each(["ES256", "EdDSA"] as const)("OIDC-02/03 verifies %s tokens", async (alg) => {
+  it.each([
+    "ES256",
+    "ES384",
+    "ES512",
+    "EdDSA",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+  ] as const)("OIDC-02/03 verifies %s tokens", async (alg) => {
     await idp.rotate(alg);
     const user = await verifier().verify(await idp.mint({ claims: { preferred_username: "bob" } }));
     expect(user.name).toBe("bob");
     expect(user.email).toBeUndefined();
+    const only = await verifier({ algorithms: [alg] }).verify(await idp.mint());
+    expect(only.sub).toBe("user-1");
+  });
+
+  it("OIDC-02 verifies an ES384 token against a JWKS key without alg (Logto)", async () => {
+    const key = await idp.rotate("ES384");
+    Reflect.deleteProperty(key.publicJwk, "alg");
+    expect(key.publicJwk.crv).toBe("P-384");
+    const user = await verifier().verify(await idp.mint());
+    expect(user.sub).toBe("user-1");
   });
 
   it("OIDC-04 rejects a wrong issuer", async () => {
@@ -112,6 +134,19 @@ describe("Verifier conformance", () => {
       .setProtectedHeader({ alg: "HS256" })
       .sign(new TextEncoder().encode("0123456789abcdef0123456789abcdef"));
     await expectAuthError(verifier().verify(hs), /not allowed/);
+    for (const alg of ["HS384", "HS512"]) {
+      const forged = await new SignJWT({ sub: "x" })
+        .setProtectedHeader({ alg })
+        .sign(new TextEncoder().encode("0123456789abcdef0123456789abcdef0123456789abcdef"));
+      await expectAuthError(verifier().verify(forged), /not allowed/);
+    }
+    for (const alg of ["None", "NONE", "ES256K"]) {
+      await expectAuthError(
+        verifier().verify(`${enc({ alg })}.${enc({ sub: "x" })}.${enc({})}`),
+        /not allowed/,
+      );
+    }
+    expect(idp.hits["/jwks"]).toBeUndefined();
     await idp.rotate("ES256");
     await expectAuthError(
       verifier({ algorithms: ["RS256"] }).verify(await idp.mint()),
@@ -131,6 +166,69 @@ describe("Verifier conformance", () => {
       .setProtectedHeader(JSON.parse(Buffer.from(h!, "base64url").toString()) as { alg: string })
       .sign(other.privateKey);
     await expectAuthError(verifier().verify(forged), /signature/);
+  });
+
+  it("OIDC-19 rejects a token whose alg does not match the key", async () => {
+    const issuer = "http://idp.test";
+    const enc = (o: object): string => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const now = Math.floor(Date.now() / 1000);
+    const claims = { iss: issuer, aud: "app-client", sub: "user-1", exp: now + 300 };
+    const p256 = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const p384 = generateKeyPairSync("ec", { namedCurve: "P-384" });
+    const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const ed = generateKeyPairSync("ed25519");
+    const jwk = (key: KeyObject, kid: string, alg?: string): Record<string, unknown> => ({
+      ...key.export({ format: "jwk" }),
+      kid,
+      use: "sig",
+      ...(alg === undefined ? {} : { alg }),
+    });
+    type Signer = "sha256" | "sha384" | "pss256" | "ed";
+    const mint = (alg: string, kid: string, key: KeyObject, how: Signer): string => {
+      const signed = `${enc({ alg, kid, typ: "JWT" })}.${enc(claims)}`;
+      const data = Buffer.from(signed);
+      let sig: Buffer;
+      if (how === "ed") sig = nodeSign(null, data, key);
+      else if (how === "pss256")
+        sig = nodeSign("sha256", data, {
+          key,
+          padding: constants.RSA_PKCS1_PSS_PADDING,
+          saltLength: 32,
+        });
+      else sig = nodeSign(how, data, { key, dsaEncoding: "ieee-p1363" });
+      return `${signed}.${sig.toString("base64url")}`;
+    };
+    const keys = [
+      jwk(p256.publicKey, "p256"),
+      jwk(p384.publicKey, "p384"),
+      jwk(rsa.publicKey, "rsa-rs256", "RS256"),
+      jwk(rsa.publicKey, "rsa"),
+      jwk(ed.publicKey, "ed"),
+    ];
+    const v = new Verifier({
+      issuer,
+      audience: "app-client",
+      jwksUrl: `${issuer}/jwks`,
+      fetch: () => Promise.resolve(Response.json({ keys })),
+    });
+    // Controls: every key verifies a token of its own algorithm.
+    await expect(v.verify(mint("ES256", "p256", p256.privateKey, "sha256"))).resolves.toBeTruthy();
+    await expect(v.verify(mint("ES384", "p384", p384.privateKey, "sha384"))).resolves.toBeTruthy();
+    await expect(v.verify(mint("PS256", "rsa", rsa.privateKey, "pss256"))).resolves.toBeTruthy();
+    await expect(
+      v.verify(mint("RS256", "rsa-rs256", rsa.privateKey, "sha256")),
+    ).resolves.toBeTruthy();
+    // The header names an algorithm the key cannot serve: no key matches.
+    await expectAuthError(v.verify(mint("ES384", "p256", p256.privateKey, "sha384")), /no key/);
+    await expectAuthError(v.verify(mint("ES256", "p384", p384.privateKey, "sha256")), /no key/);
+    await expectAuthError(v.verify(mint("ES512", "p384", p384.privateKey, "sha384")), /no key/);
+    await expectAuthError(v.verify(mint("PS256", "rsa-rs256", rsa.privateKey, "pss256")), /no key/);
+    await expectAuthError(v.verify(mint("RS256", "p256", p256.privateKey, "sha256")), /no key/);
+    await expectAuthError(v.verify(mint("ES256", "rsa", rsa.privateKey, "sha256")), /no key/);
+    await expectAuthError(v.verify(mint("ES256", "ed", ed.privateKey, "ed")), /no key/);
+    await expectAuthError(v.verify(mint("EdDSA", "p256", ed.privateKey, "ed")), /no key/);
+    // Right key type, wrong signature scheme: PKCS#1 v1.5 signature under a PS256 header.
+    await expectAuthError(v.verify(mint("PS256", "rsa", rsa.privateKey, "sha256")), /signature/);
   });
 
   it("OIDC-11 refetches the JWKS once when a new kid appears (rotation)", async () => {

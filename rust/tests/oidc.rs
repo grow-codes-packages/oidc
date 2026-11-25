@@ -1,4 +1,4 @@
-//! Conformance cases OIDC-01…OIDC-18 (docs/oidc-conformance.md) against a local fake IdP.
+//! Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against a local fake IdP.
 
 mod oidc_fake_idp;
 
@@ -86,6 +86,88 @@ async fn oidc_02_03_other_algorithms() {
 }
 
 #[tokio::test]
+async fn oidc_02_more_algorithms() {
+    for alg in ["ES384", "RS384", "RS512", "PS256", "PS384", "PS512"] {
+        let idp = FakeIdp::start("app-client", alg).await;
+        assert_eq!(idp.jwks()[0]["alg"], alg);
+        let user = verifier(&idp)
+            .verify(&idp.mint(json!({"preferred_username": "bob"})))
+            .await
+            .unwrap_or_else(|e| panic!("{alg}: {e}"));
+        assert_eq!(user.name.as_deref(), Some("bob"), "{alg}");
+        // Only allowing that one algorithm still accepts it.
+        let only = Verifier::new(VerifierOptions {
+            algorithms: vec![alg.into()],
+            ..opts(&idp)
+        })
+        .unwrap();
+        only.verify(&idp.mint(json!({}))).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oidc_19_alg_key_mismatch() {
+    // (a) P-256 key without `alg`, header ES384 (signed with the P-256 key): no P-384 key.
+    let idp = FakeIdp::start("app-client", "ES256").await;
+    idp.strip_jwk_field("key-1", "alg");
+    let v = verifier(&idp);
+    v.verify(&idp.mint(json!({}))).await.unwrap();
+    auth_err(
+        &v,
+        &idp.mint_with(json!({}), None, json!({"alg": "ES384"}), 300),
+        "no key matches kid key-1",
+    )
+    .await;
+
+    // (b) P-384 key without `alg`, header ES256.
+    let idp = FakeIdp::start("app-client", "ES384").await;
+    idp.strip_jwk_field("key-1", "alg");
+    let v = verifier(&idp);
+    v.verify(&idp.mint(json!({}))).await.unwrap();
+    auth_err(
+        &v,
+        &idp.mint_with(json!({}), None, json!({"alg": "ES256"}), 300),
+        "no key matches kid key-1",
+    )
+    .await;
+
+    // (c) RSA key declared RS256, header PS256 / RS512.
+    let idp = FakeIdp::start("app-client", "RS256").await;
+    let v = verifier(&idp);
+    for alg in ["PS256", "RS512", "ES256", "EdDSA"] {
+        auth_err(
+            &v,
+            &idp.mint_with(json!({}), None, json!({"alg": alg}), 300),
+            "no key matches kid key-1",
+        )
+        .await;
+    }
+
+    // (d) RSA key without `alg`, PKCS#1 v1.5 signature but header PS256 (and RS384).
+    idp.strip_jwk_field("key-1", "alg");
+    let v = verifier(&idp);
+    v.verify(&idp.mint(json!({}))).await.unwrap();
+    for alg in ["PS256", "RS384"] {
+        auth_err(
+            &v,
+            &idp.mint_with(json!({}), None, json!({"alg": alg}), 300),
+            "signature is invalid",
+        )
+        .await;
+    }
+
+    // An EC or OKP key never verifies an RSA algorithm, even without `alg`.
+    let idp = FakeIdp::start("app-client", "EdDSA").await;
+    idp.strip_jwk_field("key-1", "alg");
+    auth_err(
+        &verifier(&idp),
+        &idp.mint_with(json!({}), None, json!({"alg": "RS256"}), 300),
+        "no key matches kid key-1",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn oidc_04_to_08_claims() {
     let idp = FakeIdp::start("app-client", "ES256").await;
     let v = verifier(&idp);
@@ -132,12 +214,34 @@ async fn oidc_09_algorithms() {
         "HS256 is not allowed",
     )
     .await;
+    for alg in ["HS384", "HS512", "ES512", "none", "NONE"] {
+        auth_err(
+            &v,
+            &format!("{}.e30.c2ln", enc(json!({"alg": alg}))),
+            &format!("{alg} is not allowed"),
+        )
+        .await;
+    }
     auth_err(
         &v,
         &format!("{}.e30.c2ln", enc(json!({}))),
         "(none) is not allowed",
     )
     .await;
+    for bad in [
+        vec!["ES512"],
+        vec!["HS256"],
+        vec!["none"],
+        vec!["RS256", "HS512"],
+    ] {
+        let err = Verifier::new(VerifierOptions {
+            algorithms: bad.iter().map(|a| (*a).to_owned()).collect(),
+            ..opts(&idp)
+        })
+        .expect_err("unsupported algorithm must be refused");
+        assert_eq!(err.code(), ErrorCode::Config, "{bad:?}");
+        assert!(err.to_string().contains("ES384, EdDSA"), "{err}");
+    }
     auth_err(
         &v,
         &format!("{}.e30.c2ln", enc(json!({"alg": "A".repeat(40)}))),
@@ -425,7 +529,8 @@ async fn jwks_ignores_unusable_keys() {
     let mut wrong_alg = good.clone();
     wrong_alg["alg"] = json!("ES256");
     let junk = json!({"keys": ["x", {"kty": "RSA", "n": "AQAB", "e": "AQAB"}, {"kty": "RSA"},
-        {"kty": "EC", "crv": "P-256", "x": "AA", "y": "AA"}, {"kty": "OKP", "crv": "Ed25519", "x": "AA"},
+        {"kty": "EC", "crv": "P-256", "x": "AA", "y": "AA"},
+        {"kty": "EC", "crv": "P-384", "x": "AA", "y": "AA"}, {"kty": "EC", "crv": "P-521", "x": "AA", "y": "AA"}, {"kty": "OKP", "crv": "Ed25519", "x": "AA"},
         {"kty": "oct", "k": "AA"}, enc_key, wrong_alg]});
     let s = serve(&junk.to_string()).await;
     let v = Verifier::new(VerifierOptions {

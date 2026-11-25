@@ -17,6 +17,8 @@ import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.EdECPublicKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.ECGenParameterSpec;
+import java.security.spec.MGF1ParameterSpec;
+import java.security.spec.PSSParameterSpec;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -26,11 +28,14 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A local fake OpenID provider for tests: serves {@code /.well-known/openid-configuration} and
- * {@code /jwks} on 127.0.0.1, mints signed tokens (RS256/ES256/EdDSA) and rotates keys. Never use
- * it outside tests.
+ * {@code /jwks} on 127.0.0.1, mints signed tokens (RS256/384/512, PS256/384/512, ES256/384/512,
+ * EdDSA) and rotates keys. Never use it outside tests.
  */
 public final class FakeIdp implements AutoCloseable {
   private static final Base64.Encoder B64 = Base64.getUrlEncoder().withoutPadding();
+  private static final List<String> ALGORITHMS =
+      List.of(
+          "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA");
 
   /**
    * One signing key.
@@ -64,7 +69,15 @@ public final class FakeIdp implements AutoCloseable {
           int status = failStatus;
           if (status == 0) {
             if (path.equals("/.well-known/openid-configuration")) {
-              body = Json.encode(Map.of("issuer", issuer, "jwks_uri", issuer + "/jwks"));
+              body =
+                  Json.encode(
+                      Map.of(
+                          "issuer",
+                          issuer,
+                          "jwks_uri",
+                          issuer + "/jwks",
+                          "id_token_signing_alg_values_supported",
+                          ALGORITHMS));
             } else if (path.equals("/jwks")) {
               body = Json.encode(Map.of("keys", publicKeys()));
             }
@@ -86,7 +99,8 @@ public final class FakeIdp implements AutoCloseable {
    * Starts a fake IdP with one key.
    *
    * @param audience the {@code aud} of minted tokens
-   * @param alg RS256, ES256 or EdDSA
+   * @param alg RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512 or EdDSA (anything
+   *     else: RS256)
    * @return the started IdP
    * @throws IOException when the server cannot bind
    */
@@ -145,18 +159,19 @@ public final class FakeIdp implements AutoCloseable {
     return B64.encodeToString(bytes);
   }
 
-  private static byte[] fixed32(BigInteger value) {
+  private static byte[] fixed(BigInteger value, int size) {
     byte[] raw = value.toByteArray();
-    byte[] out = new byte[32];
-    int n = Math.min(raw.length, 32);
-    System.arraycopy(raw, raw.length - n, out, 32 - n, n);
+    byte[] out = new byte[size];
+    int n = Math.min(raw.length, size);
+    System.arraycopy(raw, raw.length - n, out, size - n, n);
     return out;
   }
 
   /**
    * Adds a new current key; older keys stay published until {@link #removeKey}.
    *
-   * @param alg RS256, ES256 or EdDSA
+   * @param alg RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512 or EdDSA (anything
+   *     else: RS256)
    * @return the key
    */
   public synchronized Key rotate(String alg) {
@@ -166,21 +181,24 @@ public final class FakeIdp implements AutoCloseable {
     KeyPair pair;
     try {
       switch (alg) {
-        case "ES256" -> {
+        case "ES256", "ES384", "ES512" -> {
+          int bits = Integer.parseInt(alg.substring(2));
+          int size = bits == 512 ? 66 : bits / 8;
+          String crv = bits == 512 ? "P-521" : "P-" + bits;
           KeyPairGenerator gen = KeyPairGenerator.getInstance("EC");
-          gen.initialize(new ECGenParameterSpec("secp256r1"));
+          gen.initialize(new ECGenParameterSpec(bits == 512 ? "secp521r1" : "secp" + bits + "r1"));
           pair = gen.generateKeyPair();
           ECPublicKey pub = (ECPublicKey) pair.getPublic();
           jwk.put("kty", "EC");
-          jwk.put("crv", "P-256");
-          jwk.put("x", B64.encodeToString(fixed32(pub.getW().getAffineX())));
-          jwk.put("y", B64.encodeToString(fixed32(pub.getW().getAffineY())));
+          jwk.put("crv", crv);
+          jwk.put("x", B64.encodeToString(fixed(pub.getW().getAffineX(), size)));
+          jwk.put("y", B64.encodeToString(fixed(pub.getW().getAffineY(), size)));
         }
         case "EdDSA" -> {
           pair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
           EdECPublicKey pub = (EdECPublicKey) pair.getPublic();
           byte[] le = new byte[32];
-          byte[] be = fixed32(pub.getPoint().getY());
+          byte[] be = fixed(pub.getPoint().getY(), 32);
           for (int i = 0; i < 32; i++) {
             le[i] = be[31 - i];
           }
@@ -192,7 +210,9 @@ public final class FakeIdp implements AutoCloseable {
           jwk.put("x", B64.encodeToString(le));
         }
         default -> {
-          alg = "RS256";
+          if (!ALGORITHMS.subList(0, 6).contains(alg)) { // RS256 … PS512
+            alg = "RS256";
+          }
           KeyPairGenerator gen = KeyPairGenerator.getInstance("RSA");
           gen.initialize(2048);
           pair = gen.generateKeyPair();
@@ -278,20 +298,35 @@ public final class FakeIdp implements AutoCloseable {
    * @return the signature
    */
   public static byte[] sign(Key key, byte[] data) {
-    String jca =
-        switch (key.alg()) {
-          case "ES256" -> "SHA256withECDSAinP1363Format";
-          case "EdDSA" -> "Ed25519";
-          default -> "SHA256withRSA";
-        };
     try {
-      Signature signer = Signature.getInstance(jca);
+      Signature signer = signature(key.alg());
       signer.initSign(key.privateKey());
       signer.update(data);
       return signer.sign();
     } catch (GeneralSecurityException e) {
       throw new IllegalStateException(e);
     }
+  }
+
+  private static Signature signature(String alg) throws GeneralSecurityException {
+    return switch (alg) {
+      case "ES256", "ES384", "ES512" ->
+          Signature.getInstance("SHA" + alg.substring(2) + "withECDSAinP1363Format");
+      case "EdDSA" -> Signature.getInstance("Ed25519");
+      case "PS256", "PS384", "PS512" -> {
+        String hash = "SHA-" + alg.substring(2);
+        Signature pss = Signature.getInstance("RSASSA-PSS");
+        pss.setParameter(
+            new PSSParameterSpec(
+                hash,
+                "MGF1",
+                new MGF1ParameterSpec(hash),
+                Integer.parseInt(alg.substring(2)) / 8,
+                1));
+        yield pss;
+      }
+      default -> Signature.getInstance("SHA" + alg.substring(2) + "withRSA");
+    };
   }
 
   @Override

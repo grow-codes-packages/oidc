@@ -20,11 +20,30 @@ import {
 } from "../core/index.js";
 import { extractRoles } from "./roles.js";
 
-/** Signing algorithms accepted by default (asymmetric only; `none` and HMAC are never accepted). */
-export const DEFAULT_ALGORITHMS: readonly SigningAlgorithm[] = ["RS256", "ES256", "EdDSA"];
+/**
+ * Signing algorithms accepted by default: every supported one (asymmetric only; `none` and HMAC
+ * are never accepted).
+ */
+export const DEFAULT_ALGORITHMS: readonly SigningAlgorithm[] = [
+  "RS256",
+  "RS384",
+  "RS512",
+  "PS256",
+  "PS384",
+  "PS512",
+  "ES256",
+  "ES384",
+  "ES512",
+  "EdDSA",
+];
 
-/** Supported JWS algorithms. */
-export type SigningAlgorithm = "RS256" | "ES256" | "EdDSA";
+/**
+ * Supported JWS algorithms. The JWKS key must match the algorithm: RS* and PS* need an RSA key,
+ * ES256/ES384/ES512 an EC key on P-256/P-384/P-521, EdDSA an Ed25519 key; a key's `alg`, when
+ * present, must equal the token's.
+ */
+export type SigningAlgorithm =
+  "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" | "ES256" | "ES384" | "ES512" | "EdDSA";
 
 /** Default clock skew tolerated for `exp` / `nbf` / `iat`: 60 s. */
 export const DEFAULT_CLOCK_SKEW_MS = 60_000;
@@ -59,7 +78,7 @@ export interface VerifierOptions {
   jwksUrl?: string;
   /** Claim (or dotted path such as `realm_access.roles`) holding the roles. Default `roles`. */
   rolesClaim?: string;
-  /** Accepted algorithms. Default RS256, ES256, EdDSA. */
+  /** Accepted algorithms. Default: all of {@link DEFAULT_ALGORITHMS}. */
   algorithms?: readonly SigningAlgorithm[];
   /** Clock skew tolerance in milliseconds. Default 60 000. */
   clockSkewMs?: number;
@@ -112,7 +131,8 @@ interface KeySetEntry {
 /**
  * Verifies OIDC access tokens (JWT) against the issuer's JWKS.
  *
- * Checks the signature (RS256/ES256/EdDSA allow-list), `iss` (exact), `aud` (contains),
+ * Checks the signature (RS256/384/512, PS256/384/512, ES256/384/512, EdDSA allow-list; the key's
+ * `kty`, EC `crv` and `alg` must match the token's algorithm), `iss` (exact), `aud` (contains),
  * `exp` (required) and `nbf` with a clock skew (default 60 s). Keys come from
  * `jwksUrl` or OIDC discovery, are cached (default 10 min) and refetched when a token names an
  * unknown `kid` (key rotation, at most once per cooldown).
@@ -145,7 +165,9 @@ export class Verifier {
     }
     const algorithms = options.algorithms ?? DEFAULT_ALGORITHMS;
     if (algorithms.length === 0 || algorithms.some((alg) => !DEFAULT_ALGORITHMS.includes(alg))) {
-      throw new ConfigError("oidc: algorithms must be a non-empty subset of RS256, ES256, EdDSA");
+      throw new ConfigError(
+        `oidc: algorithms must be a non-empty subset of ${DEFAULT_ALGORITHMS.join(", ")}`,
+      );
     }
     for (const [name, value] of [
       ["clockSkewMs", options.clockSkewMs],

@@ -1,7 +1,7 @@
 """A local fake OpenID provider for tests (service-owned). Never use it outside tests.
 
 Serves ``/.well-known/openid-configuration`` and ``/jwks`` on 127.0.0.1, mints signed tokens
-(RS256/ES256/EdDSA) and rotates keys::
+(RS256/384/512, PS256/384/512, ES256/384/512, EdDSA) and rotates keys::
 
     with FakeIdP(audience="api") as idp:
         token = idp.mint({"roles": ["admin"]})
@@ -19,7 +19,26 @@ from typing import Any
 import jwt
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
-__all__ = ["FakeIdP", "FakeKey"]
+__all__ = ["ALGORITHMS", "FakeIdP", "FakeKey"]
+
+#: Algorithms the fake IdP can sign with (unknown names fall back to RS256).
+ALGORITHMS: tuple[str, ...] = (
+    "RS256",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "EdDSA",
+)
+_CURVES: dict[str, ec.EllipticCurve] = {
+    "ES256": ec.SECP256R1(),
+    "ES384": ec.SECP384R1(),
+    "ES512": ec.SECP521R1(),
+}
 
 
 @dataclass
@@ -34,9 +53,9 @@ class FakeKey:
 
 def _public_jwk(alg: str, private_key: Any) -> dict[str, Any]:
     public = private_key.public_key()
-    if alg == "RS256":
+    if alg[:2] in ("RS", "PS"):
         return dict(jwt.algorithms.RSAAlgorithm.to_jwk(public, as_dict=True))
-    if alg == "ES256":
+    if alg in _CURVES:
         return dict(jwt.algorithms.ECAlgorithm.to_jwk(public, as_dict=True))
     return dict(jwt.algorithms.OKPAlgorithm.to_jwk(public, as_dict=True))
 
@@ -80,7 +99,11 @@ class FakeIdP:
                     self.end_headers()
                     return
                 if path == "/.well-known/openid-configuration":
-                    body: Any = {"issuer": idp.issuer, "jwks_uri": f"{idp.issuer}/jwks"}
+                    body: Any = {
+                        "issuer": idp.issuer,
+                        "jwks_uri": f"{idp.issuer}/jwks",
+                        "id_token_signing_alg_values_supported": list(ALGORITHMS),
+                    }
                 elif path == "/jwks":
                     body = {"keys": keys}
                 else:
@@ -109,16 +132,20 @@ class FakeIdP:
             self._server = None
 
     def rotate(self, alg: str = "RS256") -> FakeKey:
-        """Adds a new current key; older keys stay published until :meth:`remove_key`."""
+        """Adds a new current key of ``alg`` (one of :data:`ALGORITHMS`, else RS256).
+
+        Older keys stay published until :meth:`remove_key`.
+        """
         self._counter += 1
         kid = f"key-{self._counter}"
         private_key: Any
-        if alg == "ES256":
-            private_key = ec.generate_private_key(ec.SECP256R1())
+        if alg in _CURVES:
+            private_key = ec.generate_private_key(_CURVES[alg])
         elif alg == "EdDSA":
             private_key = ed25519.Ed25519PrivateKey.generate()
         else:
-            alg = "RS256"
+            if alg not in ALGORITHMS:
+                alg = "RS256"
             private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         jwk = {**_public_jwk(alg, private_key), "kid": kid, "alg": alg, "use": "sig"}
         key = FakeKey(kid, alg, private_key, jwk)

@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
@@ -37,13 +38,20 @@ const (
 
 // Supported signing algorithms (asymmetric only; "none" and HMAC are never accepted).
 const (
-	RS256 = "RS256"
-	ES256 = "ES256"
-	EdDSA = "EdDSA"
+	RS256 = "RS256" // RSASSA-PKCS1-v1_5 with SHA-256
+	RS384 = "RS384" // RSASSA-PKCS1-v1_5 with SHA-384
+	RS512 = "RS512" // RSASSA-PKCS1-v1_5 with SHA-512
+	PS256 = "PS256" // RSASSA-PSS with SHA-256
+	PS384 = "PS384" // RSASSA-PSS with SHA-384
+	PS512 = "PS512" // RSASSA-PSS with SHA-512
+	ES256 = "ES256" // ECDSA P-256 with SHA-256
+	ES384 = "ES384" // ECDSA P-384 with SHA-384
+	ES512 = "ES512" // ECDSA P-521 with SHA-512
+	EdDSA = "EdDSA" // Ed25519
 )
 
-// DefaultAlgorithms is the default algorithm allow-list.
-var DefaultAlgorithms = []string{RS256, ES256, EdDSA}
+// DefaultAlgorithms is the default algorithm allow-list: every supported algorithm.
+var DefaultAlgorithms = []string{RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512, EdDSA}
 
 // User is the authenticated user of a verified access token.
 type User struct {
@@ -74,7 +82,8 @@ type Options struct {
 	JWKSURL string
 	// RolesClaim is the claim (or dotted path such as realm_access.roles) with the roles. Default "roles".
 	RolesClaim string
-	// Algorithms is the allow-list, a subset of RS256, ES256, EdDSA. Default all three.
+	// Algorithms is the allow-list, a subset of RS256/384/512, PS256/384/512, ES256/384/512, EdDSA.
+	// Default all of them.
 	Algorithms []string
 	// ClockSkew is the exp/nbf tolerance. Default 60 s; a negative value means no tolerance.
 	ClockSkew time.Duration
@@ -90,7 +99,9 @@ type Options struct {
 
 // Verifier verifies OIDC access tokens (JWT) against the issuer's JWKS. It is safe for concurrent use.
 //
-// It checks the signature (RS256/ES256/EdDSA allow-list), iss (exact), aud (contains), exp
+// It checks the signature (RS256/384/512, PS256/384/512, ES256/384/512, EdDSA allow-list; the key
+// must match the algorithm: RSA for RS and PS, the EC curve P-256/P-384/P-521 for ES256/384/512,
+// Ed25519 for EdDSA), iss (exact), aud (contains), exp
 // (required), nbf and sub with a clock skew (default 60 s). Keys come from JWKSURL or OIDC
 // discovery, are cached (default 10 min) and refetched when a token names an unknown kid (key
 // rotation, at most once per cooldown).
@@ -148,7 +159,7 @@ func New(opts Options) (*Verifier, error) {
 	}
 	for _, alg := range v.algorithms {
 		if !slices.Contains(DefaultAlgorithms, alg) {
-			return nil, ConfigError("oidc: algorithms must be a subset of RS256, ES256, EdDSA")
+			return nil, ConfigError("oidc: algorithms must be a subset of RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512, EdDSA")
 		}
 	}
 	v.algorithms = slices.Clone(v.algorithms)
@@ -298,7 +309,7 @@ func (v *Verifier) Verify(ctx context.Context, token string) (*User, error) {
 		}
 		return nil, authErr("no key matches kid " + kid)
 	}
-	if !slices.ContainsFunc(candidates, func(k jwk) bool { return k.verify(signed, sig) }) {
+	if !slices.ContainsFunc(candidates, func(k jwk) bool { return k.verify(header.Alg, signed, sig) }) {
 		return nil, authErr("signature is invalid")
 	}
 	if err := v.checkClaims(claims); err != nil {
@@ -517,12 +528,13 @@ func parseJWK(raw json.RawMessage) (jwk, bool) {
 			return jwk{}, false
 		}
 		k.key = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(new(big.Int).SetBytes(e).Int64())}
-	case r.Kty == "EC" && r.Crv == "P-256":
+	case r.Kty == "EC" && ecCurves[r.Crv].curve != nil:
+		c := ecCurves[r.Crv]
 		x, y := b(r.X), b(r.Y)
-		if len(x) != 32 || len(y) != 32 {
+		if len(x) != c.size || len(y) != c.size {
 			return jwk{}, false
 		}
-		pub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{4}, x...), y...))
+		pub, err := ecdsa.ParseUncompressedPublicKey(c.curve, append(append([]byte{4}, x...), y...))
 		if err != nil {
 			return jwk{}, false
 		}
@@ -539,16 +551,37 @@ func parseJWK(raw json.RawMessage) (jwk, bool) {
 	return k, true
 }
 
-// compatible reports whether the key can verify alg.
+// ecCurve is a JWK curve with its coordinate size in bytes.
+type ecCurve struct {
+	curve elliptic.Curve
+	size  int
+}
+
+// ecCurves maps a JWK crv to its curve.
+var ecCurves = map[string]ecCurve{
+	"P-256": {elliptic.P256(), 32},
+	"P-384": {elliptic.P384(), 48},
+	"P-521": {elliptic.P521(), 66},
+}
+
+// ecCurveFor is the curve an ES algorithm requires.
+var ecCurveFor = map[string]string{ES256: "P-256", ES384: "P-384", ES512: "P-521"}
+
+// compatible reports whether the key can verify alg: the key type (and EC curve) must match the
+// algorithm, and a declared JWK alg must equal it.
 func (k jwk) compatible(alg string) bool {
 	if k.use == "enc" || (k.alg != "" && k.alg != alg) {
 		return false
 	}
-	switch k.key.(type) {
+	switch pub := k.key.(type) {
 	case *rsa.PublicKey:
-		return alg == RS256
+		switch alg {
+		case RS256, RS384, RS512, PS256, PS384, PS512:
+			return true
+		}
 	case *ecdsa.PublicKey:
-		return alg == ES256
+		crv, ok := ecCurveFor[alg]
+		return ok && pub.Curve == ecCurves[crv].curve
 	case ed25519.PublicKey:
 		return alg == EdDSA
 	}
@@ -565,17 +598,46 @@ func matchKeys(keys []jwk, h jwtHeader) []jwk {
 	return out
 }
 
-func (k jwk) verify(signed, sig []byte) bool {
-	digest := sha256.Sum256(signed)
+// hashFor is the digest of an RS, PS or ES algorithm (by its 3-digit suffix).
+func hashFor(alg string) crypto.Hash {
+	switch alg[len(alg)-3:] {
+	case "384":
+		return crypto.SHA384
+	case "512":
+		return crypto.SHA512
+	}
+	return crypto.SHA256
+}
+
+func digest(h crypto.Hash, data []byte) []byte {
+	switch h {
+	case crypto.SHA384:
+		d := sha512.Sum384(data)
+		return d[:]
+	case crypto.SHA512:
+		d := sha512.Sum512(data)
+		return d[:]
+	}
+	d := sha256.Sum256(data)
+	return d[:]
+}
+
+// verify checks sig over signed with alg; compatible(alg) must hold.
+func (k jwk) verify(alg string, signed, sig []byte) bool {
 	switch pub := k.key.(type) {
 	case *rsa.PublicKey:
-		return rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], sig) == nil
+		h := hashFor(alg)
+		if strings.HasPrefix(alg, "PS") {
+			return rsa.VerifyPSS(pub, h, digest(h, signed), sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthAuto, Hash: h}) == nil
+		}
+		return rsa.VerifyPKCS1v15(pub, h, digest(h, signed), sig) == nil
 	case *ecdsa.PublicKey:
-		if len(sig) != 64 {
+		size := (pub.Curve.Params().BitSize + 7) / 8
+		if len(sig) != 2*size {
 			return false
 		}
-		r, s := new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])
-		return ecdsa.Verify(pub, digest[:], r, s)
+		r, s := new(big.Int).SetBytes(sig[:size]), new(big.Int).SetBytes(sig[size:])
+		return ecdsa.Verify(pub, digest(hashFor(alg), signed), r, s)
 	case ed25519.PublicKey:
 		return ed25519.Verify(pub, signed, sig)
 	}

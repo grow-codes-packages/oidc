@@ -29,7 +29,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-/** Conformance cases OIDC-01…OIDC-17 (docs/oidc-conformance.md) against the local fake IdP. */
+/** Conformance cases OIDC-01…OIDC-19 (docs/oidc-conformance.md) against the local fake IdP. */
 class VerifierTest {
   private FakeIdp idp;
 
@@ -115,12 +115,100 @@ class VerifierTest {
   }
 
   @ParameterizedTest
-  @ValueSource(strings = {"ES256", "EdDSA"})
+  @ValueSource(
+      strings = {"ES256", "ES384", "ES512", "RS384", "RS512", "PS256", "PS384", "PS512", "EdDSA"})
   void oidc02And03OtherAlgorithms(String alg) {
-    idp.rotate(alg);
+    FakeIdp.Key key = idp.rotate(alg);
+    assertThat(key.alg()).isEqualTo(alg);
     AuthUser user = verifier().verify(idp.mint(claims("preferred_username", "bob")));
     assertThat(user.name()).contains("bob");
     assertThat(user.email()).isEmpty();
+    assertThat(Verifier.DEFAULT_ALGORITHMS).contains(alg);
+  }
+
+  @Test
+  void oidc02Es384WithoutKeyAlg() throws IOException {
+    // Logto publishes P-384 keys and signs ES384 by default.
+    FakeIdp.Key key = idp.rotate("ES384");
+    Map<String, Object> jwk = new HashMap<>(key.publicJwk());
+    jwk.remove("alg");
+    HttpServer s = serveKeys(List.of(jwk));
+    try {
+      Verifier v = builder().jwksUrl(jwksUrl(s)).build();
+      assertThat(v.verify(idp.mint(Map.of())).sub()).isEqualTo("user-1");
+    } finally {
+      s.stop(0);
+    }
+  }
+
+  @Test
+  void fakeIdpFallsBackToRs256() {
+    assertThat(idp.rotate("HS256").alg()).isEqualTo("RS256");
+    assertThat(verifier().verify(idp.mint(Map.of())).sub()).isEqualTo("user-1");
+  }
+
+  private static HttpServer serveKeys(List<?> keys) throws IOException {
+    return serve(
+        new String(
+            codes.grow.packages.oidc.core.Json.encode(Map.of("keys", keys)),
+            StandardCharsets.UTF_8));
+  }
+
+  private static String jwksUrl(HttpServer s) {
+    return "http://127.0.0.1:" + s.getAddress().getPort();
+  }
+
+  private static Map<String, Object> withoutAlg(FakeIdp.Key key) {
+    Map<String, Object> jwk = new HashMap<>(key.publicJwk());
+    jwk.remove("alg");
+    return jwk;
+  }
+
+  @Test
+  void oidc19AlgKeyMismatchIsRejected() throws IOException {
+    FakeIdp.Key p256 = idp.rotate("ES256");
+    FakeIdp.Key p384 = idp.rotate("ES384");
+    FakeIdp.Key rsa = idp.keys().get(0);
+    HttpServer s = serveKeys(List.of(withoutAlg(p256), withoutAlg(p384), withoutAlg(rsa)));
+    try {
+      Verifier v = builder().jwksUrl(jwksUrl(s)).build();
+      // (a) P-256 key without alg, header claims ES384.
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), p256.kid(), Map.of("alg", "ES384"), 300)),
+          "no key matches kid " + p256.kid());
+      // (b) P-384 key without alg, header claims ES256.
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), p384.kid(), Map.of("alg", "ES256"), 300)),
+          "no key matches kid " + p384.kid());
+      // (b') P-384 key without alg, header claims ES512.
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), p384.kid(), Map.of("alg", "ES512"), 300)),
+          "no key matches kid " + p384.kid());
+      // (d) RSA key without alg, PKCS#1 v1.5 signature but header claims PS256.
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), rsa.kid(), Map.of("alg", "PS256"), 300)),
+          "signature is invalid");
+      // RSA key header claiming an EC or EdDSA algorithm.
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), rsa.kid(), Map.of("alg", "ES256"), 300)),
+          "no key matches");
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), rsa.kid(), Map.of("alg", "EdDSA"), 300)),
+          "no key matches");
+      // EC key header claiming an RSA algorithm.
+      assertAuth(
+          () -> v.verify(idp.mint(Map.of(), p256.kid(), Map.of("alg", "RS256"), 300)),
+          "no key matches");
+    } finally {
+      s.stop(0);
+    }
+    // (c) RSA key whose JWK alg is RS256, header claims PS256 (published by the fake IdP itself).
+    assertAuth(
+        () -> verifier().verify(idp.mint(Map.of(), rsa.kid(), Map.of("alg", "PS256"), 300)),
+        "no key matches kid " + rsa.kid());
+    assertAuth(
+        () -> verifier().verify(idp.mint(Map.of(), rsa.kid(), Map.of("alg", "RS512"), 300)),
+        "no key matches kid " + rsa.kid());
   }
 
   @Test
@@ -153,7 +241,13 @@ class VerifierTest {
   void oidc09Algorithms() {
     Verifier v = verifier();
     assertAuth(() -> v.verify(enc("{\"alg\":\"none\"}") + "." + enc("{}") + "."), "not allowed");
-    assertAuth(() -> v.verify(enc("{\"alg\":\"HS256\"}") + ".e30.c2ln"), "HS256 is not allowed");
+    for (String hs : List.of("HS256", "HS384", "HS512", "None", "NONE")) {
+      assertAuth(
+          () -> v.verify(enc("{\"alg\":\"" + hs + "\"}") + ".e30.c2ln"), hs + " is not allowed");
+    }
+    assertAuth(
+        () -> v.verify(idp.mint(Map.of(), null, Map.of("alg", "HS256"), 300)),
+        "HS256 is not allowed");
     assertAuth(() -> v.verify(enc("{}") + ".e30.c2ln"), "(none) is not allowed");
     assertAuth(
         () -> v.verify(enc("{\"alg\":\"" + "A".repeat(40) + "\"}") + ".e30.c2ln"), "not allowed");
@@ -399,6 +493,10 @@ class VerifierTest {
             Map.of("kty", "RSA", "n", "AQAB", "e", "AQAB"),
             Map.of("kty", "RSA"),
             Map.of("kty", "EC", "crv", "P-384", "x", "AA", "y", "AA"),
+            Map.of("kty", "EC", "crv", "P-384", "x", "A".repeat(64), "y", "AA"),
+            Map.of("kty", "EC", "crv", "P-521", "x", "AA", "y", "AA"),
+            Map.of("kty", "EC", "crv", "P-192", "x", "AA", "y", "AA"),
+            Map.of("kty", "EC", "x", "AA", "y", "AA"),
             Map.of("kty", "EC", "crv", "P-256", "x", "AA", "y", "AA"),
             Map.of("kty", "EC", "crv", "P-256", "x", "A".repeat(43), "y", "A".repeat(43)),
             Map.of("kty", "OKP", "crv", "X25519", "x", "AA"),
